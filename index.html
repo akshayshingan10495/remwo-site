@@ -1,0 +1,1018 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>html,body{margin:0;padding:0}[hidden]{display:none!important}#getCsv{display:none!important}</style>
+<script>
+/* REMWO Telegram adapter: gives the site app the same storage calls it had on Claude,
+   but backed by the REMWO Apps Script (Google Sheets + Drive). Telegram signs every call. */
+(function () {
+  var TG = window.Telegram && Telegram.WebApp;
+  if (TG) { try { TG.ready(); TG.expand(); if (TG.disableVerticalSwipes) TG.disableVerticalSwipes(); } catch (e) { } }
+  var qs = new URLSearchParams(location.search);
+  var API = qs.get('api') || localStorageGet('remwo_api') || '';
+  if (qs.get('api')) localStorageSet('remwo_api', qs.get('api'));
+  var PROJECT = qs.get('project') || localStorageGet('remwo_project') || '';
+  function localStorageGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+  function localStorageSet(k, v) { try { localStorage.setItem(k, v); } catch (e) { } }
+
+  async function call(action, extra) {
+    if (!API) throw { code: 'no_api' };
+    var body = Object.assign({ action: action, project: PROJECT, initData: TG ? TG.initData : '' }, extra || {});
+    var r = await fetch(API, { method: 'POST', body: JSON.stringify(body) });       // text/plain: no CORS preflight
+    var j = await r.json();
+    if (!j.ok) throw { code: j.error || 'error', info: j };
+    return j;
+  }
+  window.REMWO = { call: call };
+
+  var who = null, whoErr = null, ready = call('me').then(function (j) { who = j; if (!PROJECT && j.projects[0]) PROJECT = j.projects[0].code; }).catch(function (e) { whoErr = e; });
+
+  /* fetch('/_blob/plan' | '/_blob/model:...') -> Drive files through the API */
+  var realFetch = window.fetch.bind(window);
+  window.fetch = async function (url, opt) {
+    var u = String(url);
+    if (u.indexOf('/_blob/') === 0) {
+      if (opt && opt.method === 'HEAD') return new Response('', { headers: { Date: new Date().toUTCString() } });   // server stamps the time itself
+      var j = await call('file', { name: u.slice(7) });
+      return new Response(j.text || '', { status: j.text ? 200 : 404, headers: { 'Content-Type': 'application/json' } });
+    }
+    return realFetch(url, opt);
+  };
+
+  function snap(docs) { return { docs: docs.map(function (d) { return { id: d._id, data: function () { return d; } }; }) }; }
+  function poller(fn, ms, onData, onErr) {
+    var stop = false;
+    (async function loop() { while (!stop) { try { onData(await fn()); } catch (e) { if (onErr) onErr(e); } await new Promise(function (r) { setTimeout(r, ms); }); } })();
+    return function () { stop = true; };
+  }
+  var kicks = {};
+  var db = {
+    doc: function (path) {
+      if (path === 'plan/current') {
+        var get = async function () { var j = await call('plan'); return { exists: !!j.doc, data: function () { return j.doc; } }; };
+        return { get: get, set: async function () { return true; }, onSnapshot: function (f, e) { return poller(get, 300000, f, e); } };
+      }
+      if (path.indexOf('photos/') === 0) {
+        var id = path.slice(7);
+        return { get: async function () { var j = await call('photo_get', { id: id }); return { exists: !!j.data, data: function () { return { data: j.data }; } }; } };
+      }
+      return { get: async function () { return { exists: false, data: function () { return null; } }; } };
+    },
+    collection: function (name) {
+      var list = async function () { var j = await call('list', { coll: name }); return snap(j.docs); };
+      var c = {
+        add: async function (body) {
+          if (name === 'photos') { var p = await call('photo_add', { body: body }); return { id: p.id }; }
+          var j = await call('add', { coll: name, body: body }); setTimeout(function () { (kicks[name] || []).forEach(function (k) { k(); }); }, 300); return { id: j.id };
+        },
+        get: list,
+        orderBy: function () { return c; }, limit: function () { return c; },
+        onSnapshot: function (f, e) { var s = poller(list, 60000, f, e); (kicks[name] = kicks[name] || []).push(function () { list().then(f).catch(function () { }); }); return s; }
+      };
+      return c;
+    }
+  };
+  var user = {
+    id: async function () { return who ? who.me.id : null; },
+    me: async function () { return who ? { name: who.me.name + (who.projects.length > 1 ? ' · ' + PROJECT : '') } : null; },
+    canEdit: async function () { return !!(who && (who.me.role === 'Owner' || who.me.role === 'Office')); },
+    profiles: async function (ids) { var j = await call('profiles', { ids: ids }); var o = {}; ids.forEach(function (i) { o[i] = { name: j.names[i] }; }); return o; }
+  };
+  var assets = {
+    upload: async function (blob) {
+      var txt = await blob.text(), kind = txt.indexOf('"remwo-web-1"') >= 0 ? 'model' : 'plan';
+      await call('upload', { kind: kind, text: txt });
+      return { id: kind, url: '/_blob/' + kind };
+    }
+  };
+  window.claude = {
+    use: async function (name) {
+      await ready;
+      if (whoErr || !who) { showBlock(); return null; }
+      if (name === 'db') return db;
+      if (name === 'user') return user;
+      if (name === 'assets') return assets;
+      return null;
+    }
+  };
+  function showBlock() {
+    var e = whoErr || {}, msg;
+    if (e.code === 'not_in_telegram' || !API) msg = 'Open this from the <b>REMWO Site</b> bot in Telegram (tap <b>Site app</b>).';
+    else if (e.code === 'not_staff') msg = 'Hello ' + (e.info && e.info.name || '') + '. You are not on the REMWO staff list yet. Ask the office to add your Telegram username' + (e.info && e.info.username ? ' (@' + e.info.username + ')' : '') + ' to REMWO Ops › Staff.';
+    else if (e.code === 'session_expired') msg = 'This session is old. Close the app and open it again from the bot.';
+    else msg = 'Could not reach the REMWO server (' + (e.code || 'network') + '). Check the internet and reopen.';
+    var tryIt = function () { var m = document.getElementById('main'); if (m) m.innerHTML = '<div class="note" style="margin-top:10px">' + msg + '</div>'; var s = document.getElementById('msg'); if (s) s.textContent = ''; };
+    setTimeout(tryIt, 0); setTimeout(tryIt, 500);
+  }
+})();
+
+</script>
+</head><body>
+<title>RPQS Site App</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500&display=swap">
+<style>
+/* Layout: the model fills the screen; a bottom panel carries today's list, and tapping a piece opens its card there with three big answers. */
+:root {
+  --bg: #eef1ee;
+  --card: #fbfcfa;
+  --ink: #1b272c;
+  --muted: #5b696e;
+  --line: #d2d9d4;
+  --accent: #1f5e8c;
+  --accent-ink: #ffffff;
+  --done: #2f8a4f;
+  --prog: #b9800f;
+  --hold: #c0392b;
+  --ready: #2d6fb8;
+  --wait: #8f948f;
+  --soft: #dfe8ef;
+  --scene: #e3e8e4;
+  --hl: #ff7a1a;
+  --ctx: #cfd5d0;
+  --font: "IBM Plex Sans Condensed", "Arial Narrow", Arial, sans-serif;
+  --mono: "IBM Plex Mono", Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #12191c; --card: #1a2428; --ink: #e4ebe7; --muted: #97a6aa; --line: #2d3a3f; --accent: #7fb6e3; --accent-ink: #0f1a20;
+  --done: #4fb874; --prog: #e0a63a; --hold: #e2604f; --ready: #5d9be0; --wait: #7b827e; --soft: #22384a; --scene: #10171a; --hl: #ff8c3a; --ctx: #3a4549; color-scheme: dark; } }
+:root[data-theme="dark"] {
+  --bg: #12191c; --card: #1a2428; --ink: #e4ebe7; --muted: #97a6aa; --line: #2d3a3f; --accent: #7fb6e3; --accent-ink: #0f1a20;
+  --done: #4fb874; --prog: #e0a63a; --hold: #e2604f; --ready: #5d9be0; --wait: #7b827e; --soft: #22384a; --scene: #10171a; --hl: #ff8c3a; --ctx: #3a4549; color-scheme: dark; }
+html, body { height: 100%; }
+body { background: var(--bg); color: var(--ink); font: 16px/1.35 var(--font); }
+body { overflow: hidden; }
+.app { height: 100%; display: flex; flex-direction: column; overflow: hidden; }
+.gut { padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+header.top { flex: none; padding-block: 8px 6px; display: grid; gap: 6px; background: var(--bg); }
+.stage { flex: 1 1 auto; position: relative; min-height: 0; background: var(--scene); }
+.stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+.stage .msg { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); padding: 20px; text-align: center; }
+.tools { position: absolute; right: max(10px, env(safe-area-inset-right, 0px)); top: 10px; display: grid; gap: 6px; }
+.tools button { border: 1px solid var(--line); background: var(--card); color: var(--ink); border-radius: 10px; padding: 8px 10px; font: 600 14px var(--font); cursor: pointer; }
+.legend { position: absolute; left: max(10px, env(safe-area-inset-left, 0px)); top: 10px; display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 12px; color: var(--ink); background: color-mix(in srgb, var(--card) 85%, transparent); border-radius: 10px; padding: 6px 8px; max-width: 70%; }
+.legend span { display: inline-flex; align-items: center; gap: 4px; }
+.legend i { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+.panel { flex: none; max-height: 46%; overflow-y: auto; background: var(--bg); border-top: 1px solid var(--line); border-radius: 16px 16px 0 0; margin-top: -12px; position: relative; z-index: 2; padding-block: 0 calc(16px + env(safe-area-inset-bottom, 0px)); transition: max-height .2s; }
+.panel.tall { max-height: 60%; }
+.panel.min { max-height: 64px; overflow: hidden; }
+.grip { display: block; margin: 6px auto 4px; width: 56px; height: 18px; border: 0; background: none; cursor: pointer; }
+.grip::before { content: ""; display: block; width: 40px; height: 5px; border-radius: 3px; background: var(--line); margin: 0 auto; }
+.brand { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.brand h1 { margin: 0; font-size: 20px; font-weight: 700; letter-spacing: .01em; text-wrap: balance; }
+.brand small { color: var(--muted); font-size: 13px; text-align: right; }
+.rooms { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 2px; scrollbar-width: none; }
+.chip { flex: none; border: 1px solid var(--line); background: var(--card); color: var(--ink); border-radius: 999px; padding: 8px 14px; font: 500 15px var(--font); cursor: pointer; }
+.chip.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.tabs button { border: 0; border-radius: 10px; padding: 10px; font: 600 15px var(--font); background: var(--soft); color: var(--ink); cursor: pointer; }
+.tabs button.on { background: var(--ink); color: var(--bg); }
+.note { background: var(--card); border: 1px dashed var(--line); border-radius: 12px; padding: 14px; color: var(--muted); }
+.tabs { margin-top: 2px; }
+section.grp { margin-top: 14px; display: grid; gap: 8px; }
+section.grp h2 { margin: 0; font-size: 13px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); display: flex; align-items: center; gap: 8px; }
+section.grp h2 i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.row { display: grid; grid-template-columns: 6px 1fr auto; gap: 12px; align-items: center; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px 12px 0; text-align: left; width: 100%; font: inherit; color: inherit; cursor: pointer; overflow: hidden; }
+.row .bar { align-self: stretch; border-radius: 0 4px 4px 0; }
+.row b { display: block; font-size: 17px; font-weight: 600; }
+.row span.sub { display: block; color: var(--muted); font-size: 14px; }
+.row .right { text-align: right; font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; max-width: 40%; }
+.row .right strong { display: block; color: var(--ink); font-size: 16px; white-space: nowrap; }
+.row .right { min-width: 84px; }
+.pbar { height: 5px; border-radius: 3px; background: var(--line); margin-top: 6px; overflow: hidden; }
+.pbar i { display: block; height: 100%; background: var(--prog); }
+/* activity sheet */
+.card { display: grid; gap: 12px; padding-block: 4px 10px; }
+.back { justify-self: start; border: 0; background: none; color: var(--accent); font: 600 17px var(--font); padding: 8px 0; cursor: pointer; }
+.card h2 { margin: 0; font-size: 24px; line-height: 1.15; text-wrap: balance; }
+.card .where { color: var(--muted); font-size: 16px; }
+.facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; }
+.fact { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; }
+.fact small { display: block; color: var(--muted); font-size: 12px; letter-spacing: .06em; text-transform: uppercase; }
+.fact strong { font-size: 18px; font-variant-numeric: tabular-nums; }
+.box { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
+.box h3 { margin: 0 0 6px; font-size: 13px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.box ul { margin: 0; padding-left: 18px; }
+.box .note { border: 0; padding: 0; background: none; }
+.answers { display: grid; gap: 10px; }
+.big { border: 0; border-radius: 14px; padding: 18px 16px; font: 700 20px var(--font); text-align: left; cursor: pointer; display: flex; justify-content: space-between; align-items: center; color: #fff; }
+.big small { font: 500 14px var(--font); opacity: .9; }
+.big.done { background: var(--done); } .big.prog { background: var(--prog); } .big.hold { background: var(--hold); }
+.big.sel { outline: 4px solid var(--ink); outline-offset: 2px; }
+:root:not([data-theme="light"]) .big { color: #fff; }
+.pick { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; }
+.pick button, .reasons button { border: 1px solid var(--line); background: var(--card); color: var(--ink); border-radius: 10px; padding: 12px 4px; font: 600 16px var(--font); cursor: pointer; }
+.pick button.on, .reasons button.on { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+.reasons { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.men { display: grid; gap: 6px; }
+.men .m { display: grid; grid-template-columns: 1fr auto auto auto; gap: 8px; align-items: center; }
+.men .m button { width: 44px; height: 44px; border-radius: 10px; border: 1px solid var(--line); background: var(--card); color: var(--ink); font: 700 22px var(--font); cursor: pointer; }
+.men .m output { min-width: 28px; text-align: center; font: 700 20px var(--font); font-variant-numeric: tabular-nums; }
+textarea, input[type=text] { width: 100%; box-sizing: border-box; border: 1px solid var(--line); border-radius: 10px; padding: 12px; font: 16px var(--font); background: var(--card); color: var(--ink); }
+.photo { display: flex; gap: 10px; align-items: center; }
+.photo label { border: 1px solid var(--line); background: var(--card); border-radius: 10px; padding: 12px 14px; font-weight: 600; cursor: pointer; }
+.photo img { width: 64px; height: 64px; object-fit: cover; border-radius: 8px; }
+.save { border: 0; border-radius: 14px; padding: 18px; font: 700 20px var(--font); background: var(--accent); color: var(--accent-ink); cursor: pointer; }
+.save:disabled { opacity: .5; }
+.toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(18px + env(safe-area-inset-bottom, 0px)); background: var(--ink); color: var(--bg); padding: 12px 18px; border-radius: 12px; font-weight: 600; z-index: 30; max-width: calc(100% - 32px); }
+.upd { display: grid; grid-template-columns: auto 1fr auto; gap: 10px; align-items: center; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; width: 100%; text-align: left; font: inherit; color: inherit; cursor: pointer; }
+.upd .go { color: var(--muted); font-size: 22px; }
+.bigphoto { width: 100%; max-height: 50vh; object-fit: contain; border-radius: 12px; background: var(--card); border: 1px solid var(--line); cursor: zoom-in; }
+.viewer { position: fixed; inset: 0; z-index: 40; background: rgba(0,0,0,.92); display: grid; place-items: center; padding: max(12px, env(safe-area-inset-top, 0px)) max(12px, env(safe-area-inset-right, 0px)) max(12px, env(safe-area-inset-bottom, 0px)) max(12px, env(safe-area-inset-left, 0px)); cursor: zoom-out; }
+.viewer img { max-width: 100%; max-height: 100%; object-fit: contain; }
+.viewer span { position: absolute; top: calc(10px + env(safe-area-inset-top, 0px)); right: max(14px, env(safe-area-inset-right, 0px)); color: #fff; font: 600 16px var(--font); }
+.upd img { width: 56px; height: 56px; object-fit: cover; border-radius: 8px; }
+.upd small { color: var(--muted); }
+.pill { display: inline-block; padding: 2px 8px; border-radius: 999px; color: #fff; font-size: 13px; font-weight: 600; }
+.cl { display: grid; gap: 6px; }
+.cl h4 { margin: 8px 0 0; font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.ck { display: grid; grid-template-columns: 28px 1fr auto; gap: 8px; align-items: start; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px; width: 100%; text-align: left; font: inherit; color: inherit; cursor: pointer; }
+.ck .st { width: 26px; height: 26px; border-radius: 50%; border: 2px solid var(--line); display: grid; place-items: center; font-weight: 700; color: #fff; font-size: 14px; }
+.ck .st.ok { background: var(--done); border-color: var(--done); } .ck .st.no { background: var(--hold); border-color: var(--hold); } .ck .st.val { background: var(--ready); border-color: var(--ready); font-size: 11px; }
+.ck small { display: block; color: var(--muted); font-size: 13px; }
+.ck .tag { font-size: 11px; font-weight: 700; border-radius: 6px; padding: 1px 6px; border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
+.ck .tag.hold { color: var(--hold); border-color: var(--hold); }
+.flag { color: var(--hold); font-weight: 600; font-size: 13px; }
+.ckform { display: grid; gap: 8px; background: var(--soft); border-radius: 10px; padding: 10px; }
+.ckform .yn { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.ckform .yn button { border: 0; border-radius: 10px; padding: 14px; font: 700 18px var(--font); color: #fff; cursor: pointer; opacity: .55; }
+.ckform .yn button.on { opacity: 1; outline: 3px solid var(--ink); }
+.ckform input[type=number] { width: 100%; box-sizing: border-box; border: 1px solid var(--line); border-radius: 10px; padding: 12px; font: 18px var(--font); background: var(--card); color: var(--ink); }
+.loghead { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 12px; }
+.loghead button { border: 1px solid var(--line); background: var(--card); color: var(--ink); border-radius: 10px; padding: 8px 12px; font: 600 15px var(--font); cursor: pointer; }
+.logrow { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; display: grid; gap: 2px; }
+.logrow.bad { border-color: var(--hold); }
+.tabs.three { grid-template-columns: 1fr 1fr 1fr; }
+.office { margin-top: 26px; border-top: 2px solid var(--line); padding-top: 14px; display: grid; gap: 10px; }
+.office h2 { margin: 0; font-size: 18px; }
+.office .btn { border: 1px solid var(--accent); color: var(--accent); background: var(--card); border-radius: 12px; padding: 14px; font: 600 16px var(--font); cursor: pointer; text-align: left; }
+.office .btn small { display: block; color: var(--muted); font-weight: 400; }
+.mono { font-family: var(--mono); font-size: 13px; }
+button:focus-visible, label:focus-within { outline: 3px solid var(--accent); outline-offset: 2px; }
+@media (prefers-reduced-motion: no-preference) { .row { transition: transform .08s; } .row:active { transform: scale(.99); } }
+</style>
+
+<div class="app">
+  <header class="top gut">
+    <div class="brand"><h1>RPQS Site</h1><small id="who">Renovation, Sewri</small></div>
+    <div class="rooms" id="rooms"></div>
+  </header>
+  <div class="stage" id="stage">
+    <canvas id="gl"></canvas>
+    <div class="legend" id="legend"></div>
+    <div class="tools"><button type="button" id="bFit">Fit</button><button type="button" id="bPlan">Plan</button></div>
+    <div class="msg" id="msg">Loading the model...</div>
+  </div>
+  <section class="panel" id="panel">
+    <button type="button" class="grip" id="grip" aria-label="Make the list bigger or smaller"></button>
+    <div class="gut" id="listView">
+      <div class="tabs three"><button type="button" id="tToday" class="on">Today's work</button><button type="button" id="tDone">Updates today</button><button type="button" id="tCk">Checks log</button></div>
+      <main id="main"><div class="note" style="margin-top:10px">Loading today's plan...</div></main>
+      <div class="office" id="office" hidden></div>
+    </div>
+    <div class="gut card" id="sheetIn" hidden></div>
+  </section>
+</div>
+<div class="toast" id="toast" hidden></div>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+
+<script>
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+  var esc = function (s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); };
+  var P = null, C = null, db = null, userNS = null, assets = null, me = null, canEdit = false;
+  var updates = [], names = {}, room = "", tab = "today", openAct = null, form = null, planInfo = null;
+  var HOLD = ["Client decision change", "Material unavailable", "Labour unavailable", "Other"];
+  var HOLDLBL = { "Client decision change": "Client changed it", "Material unavailable": "No material", "Labour unavailable": "No labour", "Other": "Other problem" };
+  var COL = { "Done": "var(--done)", "In progress": "var(--prog)", "Held up": "var(--hold)", "Ready": "var(--ready)", "Waiting": "var(--wait)" };
+
+  function toast(t) { var e = $("toast"); e.textContent = t; e.hidden = false; clearTimeout(toast.t); toast.t = setTimeout(function () { e.hidden = true; }, 2600); }
+  function r1(x) { return Math.round(x * 10) / 10; }
+  function roomName(c) { if (!P) return c; for (var i = 0; i < P.rooms.length; i++) if (P.rooms[i][0] == c) return P.rooms[i][1]; return c; }
+
+  /* ---------- the plan (same rules as the SketchUp panel) ---------- */
+  function itemOf(id) { return String(id).split("-")[0]; }
+  function costItem(id) { return C && C.cost && C.cost.items ? C.cost.items[itemOf(id)] || null : null; }
+  function leadOf(ci) {
+    var lead = null; if (!ci) return null;
+    ci.lab.forEach(function (l) { if (l[3] != "day") return; if (!lead || (l[0] != "HELPER" && l[2] > lead[2]) || (lead[0] == "HELPER" && l[0] != "HELPER")) lead = l; });
+    return lead;
+  }
+  function durOf(a) {
+    var ci = costItem(a.id), lead = leadOf(ci), q = a.qty || 0;
+    if (a.src == "set by you") return Math.max(1, a.dur);
+    if (lead && q > 0) { var n = (C.crew && C.crew[a.id]) || 1; return Math.max(1, Math.ceil(q * lead[2] / n - 1e-9)); }
+    return a.dur || 1;
+  }
+  function crewPlan(a) {           /* persons per trade per day */
+    var ci = costItem(a.id), d = durOf(a), out = [];
+    if (!ci) return out;
+    ci.lab.forEach(function (l) { if (l[3] == "day" && a.qty) out.push([l[1], (a.qty || 0) * l[2] / d]); });
+    return out;
+  }
+  function latestFor(act) { for (var i = 0; i < updates.length; i++) if (updates[i].act == act && updates[i].at >= planInfo.at) return updates[i]; return null; }
+  function stateOf(a) {
+    var u = latestFor(a.id);
+    if (u) { if (u.kind == "Done") return ["Done", 100]; if (u.kind == "In progress") return ["In progress", u.pct || 0]; return ["Held up", u.pct || a.pct || 0, u.kind]; }
+    if (a.status == "Done") return ["Done", 100];
+    if (a.status == "Held up") return ["Held up", a.pct || 0];
+    if (a.status == "In progress") return ["In progress", a.pct || 0];
+    return ["", 0];
+  }
+  function classify(allRooms) {
+    var map = {}, out = { prog: [], hold: [], ready: [], next: [], done: [], wait: [] };
+    C.acts.forEach(function (a) { map[a.id] = a; });
+    C.acts.forEach(function (a) {
+      if (!a.linked) return;
+      if (room && a.room != room && !allRooms) return;
+      var s = stateOf(a);
+      a._st = s;
+      if (s[0] == "Done") { out.done.push(a); return; }
+      if (s[0] == "In progress") { out.prog.push(a); return; }
+      if (s[0] == "Held up") { out.hold.push(a); return; }
+      var ok = true, onlyProg = true;
+      a._wait = [];
+      (a.preds || []).forEach(function (p) {
+        var b = map[p[0]]; if (!b) return;
+        var bs = stateOf(b)[0], sat = (p[1] == "SS" || p[1] == "SF") ? (bs == "Done" || bs == "In progress" || bs == "Held up") : bs == "Done";
+        if (!sat) { ok = false; a._wait.push(b); if (bs != "In progress") onlyProg = false; }
+      });
+      if (ok) out.ready.push(a); else if (onlyProg) out.next.push(a); else out.wait.push(a);
+    });
+    return out;
+  }
+  function find(id) { for (var i = 0; i < C.acts.length; i++) if (C.acts[i].id == id) return C.acts[i]; return null; }
+  function leftQty(a) { var s = a._st || stateOf(a); return (a.qty || 0) * (1 - (s[0] == "Done" ? 100 : s[1] || 0) / 100); }
+  function noResWhy(a) {
+    if (!costItem(a.id)) return "item " + itemOf(a.id) + " is not in the costing sheet";
+    if (!a.qty) return "quantity not measured in the model" + (a.unit == "kg" ? " (kg item - needs kg per metre)" : "");
+    return "";
+  }
+  function todayNeeds(list) {
+    var men = {}, mat = {}, miss = [];
+    list.forEach(function (a) {
+      var why = noResWhy(a);
+      if (why) { miss.push(a); return; }
+      crewPlan(a).forEach(function (x) { var n = x[0].replace(/ \(.*\)/, ""); men[n] = (men[n] || 0) + Math.max(1, Math.ceil(x[1] - 0.05)); });
+      var ci = costItem(a.id), perDay = Math.min(leftQty(a), (a.qty || 0) / durOf(a));
+      ci.mat.forEach(function (m) { if (perDay * m[2] > 0) { var k = m[1] + "|" + m[3]; mat[k] = (mat[k] || 0) + perDay * m[2]; } });
+    });
+    return { men: men, mat: mat, miss: miss };
+  }
+  function crewText(a) {
+    var c = crewPlan(a);
+    if (!c.length) return "";
+    return c.map(function (x) { return Math.max(1, Math.ceil(x[1] - 0.05)) + " " + x[0].replace(/ \(.*\)/, "").replace(/ \/ .*/, ""); }).join(" + ");
+  }
+
+  /* ---------- the model ---------- */
+  var M = null, modelId = "", meshes = [], byAct = {}, planView = false;
+  var cssv = function (v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim() || "#999"; };
+  var canvas = $("gl"), renderer = null, scene, camera, controls, rootG;
+  function init3d() {
+    if (renderer || !window.THREE) return !!renderer;
+    renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    scene = new THREE.Scene();
+    camera = new THREE.PerspectiveCamera(45, 1, 0.05, 500);
+    controls = new THREE.OrbitControls(camera, canvas);
+    controls.enableDamping = true; controls.dampingFactor = 0.12; controls.screenSpacePanning = true;
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x8a8f88, 0.85));
+    var sun = new THREE.DirectionalLight(0xffffff, 0.55); sun.position.set(6, 12, 8); scene.add(sun);
+    rootG = new THREE.Group(); scene.add(rootG);
+    new ResizeObserver(resize3d).observe($("stage"));
+    (function loop() { requestAnimationFrame(loop); controls.update(); renderer.render(scene, camera); })();
+    resize3d();
+    return true;
+  }
+  function resize3d() {
+    if (!renderer) return;
+    var r = $("stage").getBoundingClientRect();
+    renderer.setSize(r.width, r.height, false);
+    camera.aspect = r.width / Math.max(1, r.height); camera.updateProjectionMatrix();
+  }
+  function addMesh(e, v) {
+    var pos = new Float32Array(v.length);
+    for (var i = 0; i < v.length; i += 3) { pos[i] = v[i]; pos[i + 1] = v[i + 2]; pos[i + 2] = -v[i + 1]; }
+    var g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+    g.computeVertexNormals();
+    var m = new THREE.MeshLambertMaterial({ color: 0xcccccc, side: THREE.DoubleSide, transparent: true, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 });
+    var mesh = new THREE.Mesh(g, m);
+    var edges = new THREE.LineSegments(new THREE.EdgesGeometry(g, 25), new THREE.LineBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.2 }));
+    mesh.add(edges);
+    mesh.userData = { el: e, edges: edges };
+    rootG.add(mesh); meshes.push(mesh);
+  }
+  function buildModel(model) {
+    if (!init3d()) { $("msg").textContent = "3D is not available on this phone."; return; }
+    meshes.forEach(function (m) { rootG.remove(m); m.geometry.dispose(); }); meshes = []; byAct = {};
+    var ctx = {};
+    model.elements.forEach(function (e) {
+      if (e.id) { addMesh(e, e.v); (byAct[e.act] = byAct[e.act] || []).push(meshes[meshes.length - 1]); }
+      else { var c = ctx[e.layer] || (ctx[e.layer] = { parts: [], n: 0 }); c.parts.push(e.v); c.n += e.v.length; }
+    });
+    Object.keys(ctx).forEach(function (l) {
+      var c = ctx[l], all = new Float32Array(c.n), o = 0;
+      c.parts.forEach(function (v) { all.set(v, o); o += v.length; });
+      addMesh({ id: "", act: "", layer: l }, all);
+    });
+    $("msg").hidden = true;
+    colorModel(); fitCurrent();
+  }
+  var SC = { "Done": "--done", "In progress": "--prog", "Held up": "--hold", "Ready": "--ready", "Waiting": "--wait" };
+  function colorModel() {
+    if (!renderer || !meshes.length) return;
+    scene.background = new THREE.Color(cssv("--scene"));
+    var st = {};
+    if (C) {
+      var g = classify(true);
+      g.done.forEach(function (a) { st[a.id] = "Done"; }); g.prog.forEach(function (a) { st[a.id] = "In progress"; });
+      g.hold.forEach(function (a) { st[a.id] = "Held up"; }); g.ready.forEach(function (a) { st[a.id] = "Ready"; });
+      g.next.concat(g.wait).forEach(function (a) { st[a.id] = "Waiting"; });
+    }
+    var sel = openAct ? openAct.id : "";
+    meshes.forEach(function (mesh) {
+      var e = mesh.userData.el, m = mesh.material, op = 1, col;
+      if (!e.id) { col = cssv("--ctx"); op = sel || room ? 0.12 : 0.45; }
+      else {
+        col = cssv(SC[st[e.act]] || "--wait");
+        if (sel) { if (e.act == sel) col = cssv("--hl"); else op = 0.22; }
+        else if (room && e.act.split("-")[1] != room) op = 0.15;
+      }
+      m.color.set(col); m.opacity = op; m.depthWrite = op > 0.5;
+      mesh.userData.edges.material.opacity = e.act && e.act == sel ? 0.8 : op * 0.25;
+    });
+    var lg = sel ? '<span><i style="background:' + cssv("--hl") + '"></i>This work</span>' : "";
+    [["Done", "Finished"], ["In progress", "Working"], ["Held up", "Problem"], ["Ready", "Can start"], ["Waiting", "Later"]].forEach(function (x) {
+      lg += '<span><i style="background:' + cssv(SC[x[0]]) + '"></i>' + x[1] + "</span>";
+    });
+    $("legend").innerHTML = lg;
+  }
+  function fitTo(list) {
+    if (!renderer) return;
+    var box = new THREE.Box3();
+    list.forEach(function (m) { box.expandByObject(m); });
+    if (box.isEmpty()) return;
+    var c = box.getCenter(new THREE.Vector3()), sz = box.getSize(new THREE.Vector3());
+    var r = Math.max(sz.x, sz.y, sz.z, 1.2) * 0.62;
+    var d = r / Math.tan(camera.fov * Math.PI / 360) * (camera.aspect < 1 ? 1.25 / camera.aspect : 1);
+    controls.target.copy(c);
+    if (planView) camera.position.set(c.x, c.y + d, c.z + 0.001);
+    else camera.position.set(c.x - d * 0.55, c.y + d * 0.6, c.z + d * 0.75);
+    camera.near = d / 200; camera.far = d * 20; camera.updateProjectionMatrix();
+  }
+  function fitCurrent() {
+    if (openAct && byAct[openAct.id]) return fitTo(byAct[openAct.id]);
+    if (room) { var l = []; Object.keys(byAct).forEach(function (k) { if (k.split("-")[1] == room) l = l.concat(byAct[k]); }); if (l.length) return fitTo(l); }
+    var linked = meshes.filter(function (m) { return m.userData.el.id; });
+    fitTo(linked.length ? linked : meshes);
+  }
+  var down = null, ray = null, ptr = null;
+  canvas.addEventListener("pointerdown", function (e) { down = { x: e.clientX, y: e.clientY }; });
+  canvas.addEventListener("pointerup", function (e) {
+    if (!renderer || !down || Math.abs(e.clientX - down.x) + Math.abs(e.clientY - down.y) > 8) return;
+    ray = ray || new THREE.Raycaster(); ptr = ptr || new THREE.Vector2();
+    var r = canvas.getBoundingClientRect();
+    ptr.x = ((e.clientX - r.left) / r.width) * 2 - 1; ptr.y = -((e.clientY - r.top) / r.height) * 2 + 1;
+    ray.setFromCamera(ptr, camera);
+    var hits = ray.intersectObjects(meshes.filter(function (m) { return m.userData.el.id; }), false);
+    for (var i = 0; i < hits.length; i++) {
+      var act = hits[i].object.userData.el.act;
+      if (C && find(act)) { openCard(act); return; }
+    }
+    if (openAct) closeCard();
+  });
+  $("bFit").onclick = function () { fitCurrent(); };
+  $("bPlan").onclick = function () { planView = !planView; $("bPlan").textContent = planView ? "3D" : "Plan"; fitCurrent(); };
+  $("grip").onclick = function () { var pn = $("panel"); if (pn.classList.contains("min")) pn.classList.remove("min"); else if (openAct) pn.classList.toggle("tall"); else pn.classList.add("min"); };
+  window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", colorModel);
+  new MutationObserver(colorModel).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+
+  /* ---------- screens ---------- */
+  function renderRooms() {
+    if (!P) return;
+    var h = '<button type="button" class="chip' + (room ? "" : " on") + '" data-room="">All rooms</button>';
+    var used = {}; C.acts.forEach(function (a) { if (a.linked) used[a.room] = 1; });
+    P.rooms.forEach(function (r) { if (used[r[0]]) h += '<button type="button" class="chip' + (room == r[0] ? " on" : "") + '" data-room="' + esc(r[0]) + '">' + esc(r[1]) + "</button>"; });
+    $("rooms").innerHTML = h;
+  }
+  function rowHtml(a, color, extra) {
+    var s = a._st || ["", 0], q = leftQty(a);
+    return '<button type="button" class="row" data-act="' + esc(a.id) + '"><span class="bar" style="background:' + color + '"></span><span><b>' + esc(a.desc) + '</b><span class="sub">' +
+      esc(roomName(a.room) + " · " + a.where) + (extra ? " · " + esc(extra) : "") + "</span>" + (s[0] == "In progress" || s[0] == "Held up" ? '<span class="pbar"><i style="width:' + (s[1] || 0) + '%"></i></span>' : "") +
+      '</span><span class="right"><strong>' + (a.qty ? r1(q) + " " + esc(a.unit) : "&nbsp;") + "</strong>" + esc(crewText(a) || (noResWhy(a) ? "men: not set" : "")) + "</span></button>";
+  }
+  function renderToday() {
+    if (!C) return;
+    var g = classify(), h = "";
+    function grp(title, list, color, ex) {
+      if (!list.length) return "";
+      return '<section class="grp"><h2><i style="background:' + color + '"></i>' + title + " (" + list.length + ")</h2>" + list.map(function (a) { return rowHtml(a, color, ex ? ex(a) : ""); }).join("") + "</section>";
+    }
+    var nd = todayNeeds(g.prog.concat(g.ready));
+    var mk = Object.keys(nd.men), tk = Object.keys(nd.mat).filter(function (k) { return r1(nd.mat[k]) > 0; });
+    if (mk.length || tk.length || nd.miss.length) {
+      h += '<section class="grp"><div class="box need"><h3>Needed today (working now + can start)</h3>';
+      if (mk.length) h += '<div><b>Men:</b> ' + mk.map(function (k) { return nd.men[k] + " " + esc(k); }).join(", ") + " &nbsp;<small>(" + mk.reduce(function (s, k) { return s + nd.men[k]; }, 0) + " total)</small></div>";
+      if (tk.length) h += '<div style="margin-top:6px"><b>Material for one day:</b><ul>' + tk.map(function (k) { var p = k.split("|"); return "<li>" + r1(nd.mat[k]) + " " + esc(p[1]) + " " + esc(p[0]) + "</li>"; }).join("") + "</ul></div>";
+      if (nd.miss.length) h += '<div class="note" style="margin-top:6px">No men / material shown for ' + nd.miss.length + " activit" + (nd.miss.length > 1 ? "ies" : "y") + ": " +
+        esc(Object.keys(nd.miss.reduce(function (o, a) { o[noResWhy(a)] = 1; return o; }, {})).join("; ")) + ".</div>";
+      h += "</div></section>";
+    }
+    h += grp("Working now", g.prog, COL["In progress"], function (a) { return (a._st[1] || 0) + "% done"; });
+    h += grp("Held up", g.hold, COL["Held up"], function (a) { return HOLDLBL[a._st[2]] || "held up"; });
+    h += grp("Can start now", g.ready, COL.Ready);
+    h += grp("Starts after work in progress", g.next, COL.Waiting, function (a) { return "after " + a._wait.map(function (b) { return b.desc; }).join(", "); });
+    if (!h) h = '<div class="note">Nothing to show' + (room ? " in " + esc(roomName(room)) : "") + ". Everything here is done, or waits for earlier work.</div>";
+    h += '<p class="note" style="margin-top:18px">' + g.done.length + " activities already done" + (room ? " in this room" : "") + ". Plan sent " + esc(P.made) + ".</p>";
+    $("main").innerHTML = h;
+  }
+  function renderUpdates() {
+    var today = new Date().toDateString(), list = updates.filter(function (u) { return new Date(u.at).toDateString() == today; });
+    if (!list.length) { $("main").innerHTML = '<div class="note">No updates yet today. Open an activity under Today\'s work and tap Finished, Working or Problem.</div>'; return; }
+    var h = '<section class="grp">';
+    list.forEach(function (u, i) {
+      var a = C ? find(u.act) : null, col = u.kind == "Done" ? COL.Done : u.kind == "In progress" ? COL["In progress"] : COL["Held up"];
+      h += '<button type="button" class="upd" data-upd="' + esc(u._id) + '">' + (u.photo && photoCache[u.photo] && photoCache[u.photo] != "none" ? '<img alt="Site photo" src="' + esc(photoCache[u.photo]) + '">' : "<span></span>") + "<div><b>" + esc(a ? a.desc : u.act) + "</b> <span class=\"pill\" style=\"background:" + col + '">' +
+        esc(u.kind == "In progress" ? (u.pct || 0) + "% done" : u.kind == "Done" ? "Finished" : HOLDLBL[u.kind] || u.kind) + "</span><br><small>" + esc(a ? roomName(a.room) + " · " + a.where : "") + " · " +
+        new Date(u.at).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }) + ' · <span data-by="' + i + '"></span></small>' + (u.note ? "<br>" + esc(u.note) : "") +
+        (u.men ? "<br><small>Men: " + esc(Object.keys(u.men).map(function (k) { return u.men[k] + " " + k; }).join(", ")) + "</small>" : "") + '</div><span class="go">&#8250;</span></button>';
+    });
+    $("main").innerHTML = h + "</section>";
+    list.forEach(function (u, i) { var el = document.querySelector('[data-by="' + i + '"]'); if (el) el.textContent = names[u.by] || "Someone"; });
+  }
+  var photoCache = {};
+  async function loadPhotos() {
+    var today = new Date().toDateString(), need = updates.filter(function (u) { return u.photo && !photoCache[u.photo] && new Date(u.at).toDateString() == today; });
+    if (!need.length || !db) return;
+    await Promise.all(need.map(async function (u) { try { var ph = await db.doc("photos/" + u.photo).get(); photoCache[u.photo] = ph.exists ? ph.data().data : "none"; } catch (e) { photoCache[u.photo] = "none"; } }));
+    if (tab == "done" && !openAct) renderUpdates();
+  }
+  function render() {
+    $("tToday").classList.toggle("on", tab == "today"); $("tDone").classList.toggle("on", tab == "done"); $("tCk").classList.toggle("on", tab == "ck");
+    renderRooms();
+    if (!C) {
+      $("main").innerHTML = '<div class="note">' + (planInfo === null ? "Loading today's plan..." : "No plan has been sent to the phone yet. In the office, open this page and use <b>Send today's plan</b>.") + "</div>";
+    } else if (tab == "today") renderToday(); else if (tab == "ck") renderLog(); else { renderUpdates(); loadPhotos(); }
+    renderOffice();
+    colorModel();
+  }
+
+  /* ---------- checklist (from RPQS_Engineer_Checklist.xlsx) ---------- */
+  var CK = {"I01":[["I01-01","B","Is the truck Empty before loading","yn","N"],["I01-01a","B","Malba collected in bags / heaps at the agreed loading point, not blocking passages","yn","N"],["I01-03","D","Truck / tempo trips counted (volume per trip noted)","num","N"],["I01-04","D","Truck covered with tarpaulin; no spillage on road or premises","ynp","N"],["I01-05","C","Loading area swept clean after each lift","yn","N"],["I01-06","M","Volume measured as stacked / per trip, as directed by EIC; trip slips kept","num","N"],["I01-07","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I01-08","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I02":[["I02-01","B","AAC blocks Grade-1, density 551-650 kg/cum; manufacturer test certificate received","ynp","Y"],["I02-02","B","Wall line, door/window openings and lintel levels marked as per drawing","ynp","Y"],["I02-03","B","Base cleaned; first course laid in CM 1:4 and levelled","yn","Y"],["I02-04","D","Thin-bed polymer adhesive used (approved brand); joints about 3 mm","yn","N"],["I02-05","D","Courses in level and plumb (check with spirit level / plumb bob every 3 courses)","ynp","N"],["I02-06","D","Vertical joints staggered; MS ties / mesh at RCC junctions fixed","yn","N"],["I02-07","D","RCC band / lintel provided where required (paid separately)","yn","N"],["I02-08","C","Wall plumb within 5 mm in 3 m; no broken blocks in face","ynp","Y"],["I02-09","C","Extra adhesive cleaned off; area cleared","yn","N"],["I02-10","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I02-11","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I03A":[["I03A-01","B","Granite / marble sample, colour and shade approved by EIC","ynp","Y"],["I03A-02","B","Slabs checked for thickness (18 mm / 16 mm), cracks, chipped edges","yn","Y"],["I03A-03","B","Base / substrate cleaned, level and right for fixing","yn","N"],["I03A-04","D","Fixed with approved mortar / epoxy as per specification","yn","N"],["I03A-05","D","Joints uniform and filled with matching white cement + pigment","yn","N"],["I03A-06","D","Line, level and slope checked during fixing","ynp","N"],["I03A-08","C","Exposed edges bull-nosed / machine polished; no hollow sound on tapping","ynp","Y"],["I03A-09","C","Surface polished and waxed; stains and mortar removed","yn","N"],["I03A-10","C","Finished work protected from damage by other trades","yn","N"],["I03A-11","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I03A-12","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I03B":[["I03B-01","B","Granite / marble sample, colour and shade approved by EIC","ynp","Y"],["I03B-02","B","Slabs checked for thickness (18 mm / 16 mm), cracks, chipped edges","yn","Y"],["I03B-03","B","Base / substrate cleaned, level and right for fixing","yn","N"],["I03B-04","D","Fixed with approved mortar / epoxy as per specification","yn","N"],["I03B-05","D","Joints uniform and filled with matching white cement + pigment","yn","N"],["I03B-06","D","Line, level and slope checked during fixing","ynp","N"],["I03B-08","C","Exposed edges bull-nosed / machine polished; no hollow sound on tapping","ynp","Y"],["I03B-09","C","Surface polished and waxed; stains and mortar removed","yn","N"],["I03B-10","C","Finished work protected from damage by other trades","yn","N"],["I03B-11","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I03B-12","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I04":[["I04-01","B","Granite / marble sample, colour and shade approved by EIC","ynp","Y"],["I04-02","B","Slabs checked for thickness (18 mm / 16 mm), cracks, chipped edges","yn","Y"],["I04-03","B","Base / substrate cleaned, level and right for fixing","yn","N"],["I04-05","D","Joints uniform and filled with matching white cement + pigment","yn","N"],["I04-06","D","Line, level and slope checked during fixing","ynp","N"],["I04-07","D","Facia / drop height up to 150 mm; edges polished both sides","yn","N"],["I04-08","C","Exposed edges bull-nosed / machine polished; no hollow sound on tapping","ynp","Y"],["I04-09","C","Surface polished and waxed; stains and mortar removed","yn","N"],["I04-10","C","Finished work protected from damage by other trades","yn","N"],["I04-11","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I04-12","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I05":[["I05-02","B","Slabs checked for thickness (18 mm / 16 mm), cracks, chipped edges","yn","Y"],["I05-03","B","Base / substrate cleaned, level and right for fixing","yn","N"],["I05-05","D","Joints uniform and filled with matching white cement + pigment","yn","N"],["I05-06","D","Line, level and slope checked during fixing","ynp","N"],["I05-07","D","Basin cut-out matches basin template; tap holes at marked positions","ynp","Y"],["I05-08","C","Exposed edges bull-nosed / machine polished; no hollow sound on tapping","ynp","Y"],["I05-09","C","Surface polished and waxed; stains and mortar removed","yn","N"],["I05-10","C","Finished work protected from damage by other trades","yn","N"],["I05-11","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I05-12","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I06":[["I06-01","B","Plywood brand, grade and thickness approved (ISI mark, IS 303 / IS 710 / IS 1328 as applicable)","ynp","Y"],["I06-02","B","Frame / backing line and level checked before fixing","yn","Y"],["I06-03","B","4 mm ply with one side decorative veneer, IS 1328 Type-1; veneer sample approved","ynp","Y"],["I06-04","D","Sheets fixed with screws / nails at specified spacing; joints aligned","yn","N"],["I06-05","D","grain direction consistent","yn","N"],["I06-06","D","Openings for electrical points cut neatly at marked locations","yn","N"],["I06-07","C","Surface flat, no bulging, no gaps at joints","ynp","Y"],["I06-08","C","Exposed edges finished with lipping / beading as per drawing","yn","N"],["I06-09","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I06-10","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I07":[["I07-01","B","Shutter / hardware make, model and ISI mark approved","ynp","Y"],["I07-02","B","Frame size and squareness checked before fixing","yn","N"],["I07-03","D","Fixed with correct number and size of screws; holes pre-drilled","yn","N"],["I07-04","D","SS butt hinges: 3 per shutter (or as specified), ISI marked, fully screwed","num","N"],["I07-05","C","Door opens and closes freely without rubbing; no gap more than 3 mm","ynp","Y"],["I07-06","C","Hardware works smoothly; no scratches; protective film removed","yn","N"],["I07-07","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I07-08","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I08":[["I08-01","B","Hinges, towerbolt, halndle, aldrop make, model and ISI mark approved","ynp","Y"],["I08-02","B","Frame size and squareness checked before fixing","yn","N"],["I08-03","D","Fixed with correct number and size of screws; holes pre-drilled","yn","N"],["I08-04","D","Teak lipping on all edges, flush and sanded","yn","N"],["I08-05","C","Door opens and closes freely without rubbing; no gap more than 3 mm","ynp","Y"],["I08-06","C","Hardware works smoothly; no scratches; protective film removed","yn","N"],["I08-07","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I08-08","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I09":[["I09-01","B","make, model and ISI mark approved","ynp","Y"],["I09-03","D","Fixed with correct number and size of screws; holes pre-drilled","yn","N"],["I09-04","C","Door opens and closes freely without rubbing; no gap more than 3 mm","ynp","Y"],["I09-05","C","Hardware works smoothly; no scratches; protective film removed","yn","N"],["I09-06","C","Closer adjusted: door closes fully without banging","yn","Y"],["I09-07","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I09-08","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I10":[["I10-01","B","Shutter / hardware make, model and ISI mark approved","ynp","Y"],["I10-02","B","Frame size and squareness checked before fixing","yn","N"],["I10-03","D","Fixed with correct number and size of screws; holes pre-drilled","yn","N"],["I10-04","C","Door opens and closes freely without rubbing; no gap more than 3 mm","ynp","Y"],["I10-05","C","Hardware works smoothly; no scratches; protective film removed","yn","N"],["I10-06","C","Closer adjusted: door closes fully without banging (heavy door, double speed)","yn","Y"],["I10-07","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I10-08","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I11":[["I11-01","B","Shutter / hardware make, model and ISI mark approved","ynp","Y"],["I11-02","B","Door bolt size and thickness checked before fixing","yn","N"],["I11-03","D","Fixed with correct number and size of screws; holes pre-drilled","yn","N"],["I11-04","C","Door opens and closes freely without rubbing; no gap more than 3 mm","ynp","Y"],["I11-05","C","Hardware works smoothly; no scratches; protective film removed","yn","N"],["I11-06","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I11-07","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I12":[["I12-01","B","Shutter / hardware make, model and ISI mark approved","ynp","Y"],["I12-02","B","Frame size and squareness checked before fixing","yn","N"],["I12-03","D","Fixed with correct number and size of screws; holes pre-drilled","yn","N"],["I12-04","C","Door opens and closes freely without rubbing; no gap more than 3 mm","ynp","Y"],["I12-05","C","Hardware works smoothly; no scratches; protective film removed","yn","N"],["I12-06","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I12-07","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I13":[["I13-01","B","Shutter / hardware make, model and ISI mark approved","ynp","Y"],["I13-02","B","Handle size and surface finish checked before fixing","yn","N"],["I13-03","D","Fixed with correct number and size of screws; holes pre-drilled","yn","N"],["I13-04","C","Door opens and closes freely without rubbing; no gap more than 3 mm","ynp","Y"],["I13-05","C","Hardware works smoothly; no scratches; protective film removed","yn","N"],["I13-06","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I13-07","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I14":[["I14-01","B","Ceiling height and level marked on walls; services above ceiling completed","ynp","Y"],["I14-02","B","GI sections / boards / tiles of approved make; test certificates received","yn","Y"],["I14-03","D","Hangers / main channels at specified spacing (check c/c distance)","num","N"],["I14-04","D","Grid / framework level checked with laser or water level","ynp","Y"],["I14-05","D","Openings for lights, AC grilles, detectors cut at correct locations","yn","N"],["I14-06","D","Board joints staggered; screws at 230 mm c/c and countersunk","yn","N"],["I14-07","C","Ceiling level within 3 mm; joints taped / tiles sitting properly","ynp","Y"],["I14-08","C","No stains, damaged boards or loose tiles","yn","N"],["I14-09","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I14-10","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I15":[["I15-01","B","Ceiling height and level marked on walls; services above ceiling completed","ynp","Y"],["I15-02","B","GI sections / boards / tiles of approved make; test certificates received","yn","Y"],["I15-03","D","Hangers / main channels at specified spacing (check c/c distance)","num","N"],["I15-04","D","Grid / framework level checked with laser or water level","ynp","Y"],["I15-05","D","Openings for lights, AC grilles, detectors cut at correct locations","yn","N"],["I15-06","D","Tiles 595 x 595 seated in T-grid; cut tiles at edges neat","yn","N"],["I15-07","C","Ceiling level within 3 mm; joints taped / tiles sitting properly","ynp","Y"],["I15-08","C","No stains, damaged boards or loose tiles","yn","N"],["I15-09","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I15-10","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I16":[["I16-01","B","Paint brand, shade and product approved; sealed tins checked","ynp","Y"],["I16-02","B","Surface dry, clean and prepared (sand-papered, dust removed)","yn","Y"],["I16-03","B","Floor, fittings and furniture covered with polythene / masking tape","yn","N"],["I16-04","D","Primer / previous coat dry before next coat (time noted)","yn","N"],["I16-05","D","Number of coats as per BOQ item","num","Y"],["I16-06","C","Uniform finish, no brush marks, patches, drips or shade difference","ynp","Y"],["I16-07","C","Masking removed; splashes on glass, floor and fittings cleaned","yn","N"],["I16-08","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I16-09","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I17":[["I17-01","B","Wall putty brand approved; surface free of loose material and dampness","yn","Y"],["I17-02","D","Applied in thin coats; each coat dry before the next","yn","N"],["I17-03","C","Surface smooth and even after sanding (check with tube light / torch)","ynp","Y"],["I17-04","C","Dust removed; ready for primer / paint","yn","N"],["I17-05","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I17-06","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I18A":[["I18A-01","B","Paint brand, shade and product approved; sealed tins checked","ynp","Y"],["I18A-02","B","Surface dry, clean and prepared (sand-papered, dust removed)","yn","Y"],["I18A-03","B","Floor, fittings and furniture covered with polythene / masking tape","yn","N"],["I18A-04","D","Primer / previous coat dry before next coat (time noted)","yn","N"],["I18A-05","D","Number of coats as per BOQ item","num","Y"],["I18A-06","C","Uniform finish, no brush marks, patches, drips or shade difference","ynp","Y"],["I18A-07","C","Masking removed; splashes on glass, floor and fittings cleaned","yn","N"],["I18A-08","C","One coat completed over primed surface","yn","N"],["I18A-09","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I18A-10","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I18B":[["I18B-01","B","Paint brand, shade and product approved; sealed tins checked","ynp","Y"],["I18B-02","B","Surface dry, clean and prepared (sand-papered, dust removed)","yn","Y"],["I18B-03","B","Floor, fittings and furniture covered with polythene / masking tape","yn","N"],["I18B-04","D","Primer / previous coat dry before next coat (time noted)","yn","N"],["I18B-05","D","Number of coats as per BOQ item","num","Y"],["I18B-06","C","Uniform finish, no brush marks, patches, drips or shade difference","ynp","Y"],["I18B-07","C","Masking removed; splashes on glass, floor and fittings cleaned","yn","N"],["I18B-08","C","Second coat applied after first coat fully dry","yn","Y"],["I18B-09","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I18B-10","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I19":[["I19-01","B","Area to be scraped marked and agreed with EIC","yn","N"],["I19-02","D","Old paint / distemper fully removed down to sound surface","ynp","N"],["I19-03","C","Debris collected in bags; surface washed and dry","yn","N"],["I19-04","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I19-05","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I20":[["I20-01","B","Paint brand, shade and product approved; sealed tins checked","ynp","Y"],["I20-02","B","Surface dry, clean and prepared (sand-papered, dust removed)","yn","Y"],["I20-03","B","Floor, fittings and furniture covered with polythene / masking tape","yn","N"],["I20-04","D","Primer / previous coat dry before next coat (time noted)","yn","N"],["I20-05","D","Number of coats as per BOQ item","num","Y"],["I20-06","C","Uniform finish, no brush marks, patches, drips or shade difference","ynp","Y"],["I20-07","C","Masking removed; splashes on glass, floor and fittings cleaned","yn","N"],["I20-08","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I20-09","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I21":[["I21-01","B","Wood surface sanded, filled and dust-free before polishing","yn","Y"],["I21-02","D","Sealer and melamine coats applied as per specification","num","N"],["I21-03","C","Even high-gloss / matt finish; no runs, dust specks or blush","ynp","Y"],["I21-04","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I21-05","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I22":[["I22-01","B","Surface hacked / cleaned and wetted; dots and screeds fixed for thickness","ynp","Y"],["I22-02","D","Ready-mix plaster of approved brand; thickness 15 mm checked","num","N"],["I22-03","D","Corners and edges straight; applied in single / two coats as specified","yn","N"],["I22-04","C","Surface true to line with 2 m straight edge (gap not more than 4 mm)","ynp","Y"],["I22-05","C","Curing done as per manufacturer (self-curing confirmed)","yn","N"],["I22-06","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I22-07","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I23":[["I23-01","B","Glass thickness, type (toughened mentioned where specified) and make checked","ynp","Y"],["I23-02","D","Glass set with gaskets / beading; no direct glass-to-metal contact","yn","N"],["I23-03","C","Glass clean, no cracks or scratches; labels removed","ynp","Y"],["I23-04","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I23-05","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I24":[["I24-01","B","Location and access agreed; safety arrangements for confined space in place","ynp","Y"],["I24-02","D","Silt / sludge removed and disposed of as directed","yn","N"],["I24-03","C","Free flow / clean condition checked and shown to EIC","ynp","Y"],["I24-04","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I24-05","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I25":[["I25-01","B","Location and access agreed; safety arrangements for confined space in place","ynp","Y"],["I25-02","D","Silt / sludge removed and disposed of as directed","yn","N"],["I25-03","D","Length of line cleaned recorded manhole to manhole","num","N"],["I25-04","C","Free flow / clean condition checked and shown to EIC","ynp","Y"],["I25-05","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I25-06","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I26":[["I26-01","B","Location and access agreed; safety arrangements for confined space in place","ynp","Y"],["I26-02","D","Silt / sludge removed and disposed of as directed","yn","N"],["I26-03","C","Free flow / clean condition checked and shown to EIC","ynp","Y"],["I26-04","C","Tank disinfected and refilled; water clear","ynp","Y"],["I26-05","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I26-06","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I27":[["I27-01","B","Items to be dismantled marked and agreed with EIC","ynp","Y"],["I27-02","B","Electrical / water connections isolated; area barricaded","yn","Y"],["I27-03","D","Dismantled serviceable material stacked separately for handing over","yn","N"],["I27-04","D","No damage to adjoining work","yn","N"],["I27-05","C","Debris removed; area cleared for next trade","ynp","N"],["I27-06","C","Handed-over material listed and signed by EIC / user","yn","N"],["I27-07","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I27-08","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I28":[["I28-01","B","Items to be dismantled marked measured and agreed with EIC","ynp","Y"],["I28-02","B","Electrical / water connections isolated; area barricaded","yn","Y"],["I28-03","D","Dismantled serviceable material stacked separately for handing over","yn","N"],["I28-04","D","No damage to adjoining work","yn","N"],["I28-05","C","Debris removed; area cleared for next trade","ynp","N"],["I28-06","C","Handed-over material listed and signed by EIC / user","yn","N"],["I28-07","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I28-08","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I29A":[["I29A-01","B","Items to be dismantled marked and agreed with EIC","ynp","Y"],["I29A-02","B","Electrical / water connections isolated; area barricaded","yn","Y"],["I29A-03","D","Dismantled serviceable material stacked separately for handing over","yn","N"],["I29A-04","D","No damage to adjoining work","yn","N"],["I29A-05","D","Pipe length dismantled recorded (75-80 mm dia)","num","N"],["I29A-06","C","Debris removed; area cleared for next trade","ynp","N"],["I29A-07","C","Handed-over material listed and signed by EIC / user","yn","N"],["I29A-08","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I29A-09","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I29B":[["I29B-01","B","Items to be dismantled marked and agreed with EIC","ynp","Y"],["I29B-02","B","Electrical / water connections isolated; area barricaded","yn","Y"],["I29B-03","D","Dismantled serviceable material stacked separately for handing over","yn","N"],["I29B-04","D","No damage to adjoining work","yn","N"],["I29B-05","D","Pipe length dismantled recorded (100 mm dia)","num","N"],["I29B-06","C","Debris removed; area cleared for next trade","ynp","N"],["I29B-07","C","Handed-over material listed and signed by EIC / user","yn","N"],["I29B-08","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I29B-09","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I30":[["I30-01","B","Items to be dismantled marked and agreed with EIC","ynp","Y"],["I30-02","B","Electrical / water connections isolated; area barricaded","yn","Y"],["I30-03","D","Dismantled serviceable material stacked separately for handing over","yn","N"],["I30-04","D","No damage to adjoining work","yn","N"],["I30-05","C","Debris removed; area cleared for next trade","ynp","N"],["I30-06","C","Handed-over material listed and signed by EIC / user","yn","N"],["I30-07","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I30-08","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I31":[["I31-01","B","Items to be dismantled marked and agreed with EIC","ynp","Y"],["I31-02","B","Electrical / water connections isolated; area barricaded","yn","Y"],["I31-03","D","Dismantled serviceable material stacked separately for handing over","yn","N"],["I31-04","D","No damage to adjoining work","yn","N"],["I31-05","D","Aluminium sections and gypsum boards stacked separately for handing over","yn","N"],["I31-06","C","Debris removed; area cleared for next trade","ynp","N"],["I31-07","C","Handed-over material listed and signed by EIC / user","yn","N"],["I31-08","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I31-09","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I32":[["I32-01","B","Pipe / fitting make and class approved (ISI marked)","ynp","Y"],["I32-02","B","Route and levels marked as per drawing","yn","N"],["I32-03","D","Joints made with correct solvent / fittings; clamps at specified spacing","yn","N"],["I32-04","D","Slope maintained for waste / drain lines","yn","N"],["I32-05","C","Pressure / leak test done and passed (before concealing)","ynp","Y"],["I32-06","C","Chases filled and made good after testing","yn","N"],["I32-07","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I32-08","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I33":[["I33-01","B","Make, model and finish approved; item checked for damage before fixing","ynp","Y"],["I33-02","B","Fixing height and position marked as per drawing","yn","N"],["I33-03","D","Fixed with rawl plugs / brackets as recommended; level checked","yn","N"],["I33-04","C","Works correctly; no leakage at joints (water fittings)","ynp","Y"],["I33-05","C","Cleaned; protective film removed; silicone neat where used","yn","N"],["I33-06","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I33-07","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I34":[["I34-01","B","Pipe / fitting make and class approved (ISI marked)","ynp","Y"],["I34-02","B","Route and levels marked as per drawing","yn","N"],["I34-03","D","Joints made with correct solvent / fittings; clamps at specified spacing","yn","N"],["I34-04","D","Slope maintained for waste / drain lines","yn","N"],["I34-05","C","Pressure / leak test done and passed (before concealing)","ynp","Y"],["I34-06","C","Chases filled and made good after testing","yn","N"],["I34-07","C","Hydraulic test at 1.5 times working pressure for 30 minutes","ynp","Y"],["I34-08","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I34-09","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I35":[["I35-01","B","Cover size and load class approved","yn","Y"],["I35-02","D","Frame bedded in level with surrounding surface","yn","N"],["I35-03","C","Cover sits firmly without rocking","ynp","Y"],["I35-04","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I35-05","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I36A":[["I36A-01","B","Section make, profile and weight per metre approved (sample piece kept)","ynp","Y"],["I36A-02","B","Powder coating / anodising thickness certificate received","yn","Y"],["I36A-03","B","Site measurements and opening sizes checked against shop drawing","yn","Y"],["I36A-04","D","Frames fixed plumb and square with anchor fasteners at specified spacing","ynp","N"],["I36A-05","D","Weight of sections recorded for kg measurement","num","N"],["I36A-06","C","Joints neat; no scratches on coating; protective tape removed","yn","N"],["I36A-07","C","Shutters (if any) operate smoothly and lock properly","yn","Y"],["I36A-08","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I36A-09","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I36B":[["I36B-01","B","Section make, profile and weight per metre approved (sample piece kept)","ynp","Y"],["I36B-02","B","Powder coating / anodising thickness certificate received","yn","Y"],["I36B-03","B","Site measurements and opening sizes checked against shop drawing","yn","Y"],["I36B-04","D","Frames fixed plumb and square with anchor fasteners at specified spacing","ynp","N"],["I36B-05","D","Weight of sections recorded for kg measurement","num","N"],["I36B-06","C","Joints neat; no scratches on coating; protective tape removed","yn","N"],["I36B-07","C","Shutters (if any) operate smoothly and lock properly","yn","Y"],["I36B-08","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I36B-09","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I37A":[["I37A-01","B","Glass thickness, type (toughened where specified) and make checked","ynp","Y"],["I37A-02","D","Glass set with gaskets / beading; no direct glass-to-metal contact","yn","N"],["I37A-03","C","Glass clean, no cracks or scratches; labels removed","ynp","Y"],["I37A-04","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I37A-05","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I37B":[["I37B-01","B","Glass thickness, type (toughened where specified) and make checked","ynp","Y"],["I37B-02","D","Glass set with gaskets / beading; no direct glass-to-metal contact","yn","N"],["I37B-03","C","Glass clean, no cracks or scratches; labels removed","ynp","Y"],["I37B-04","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I37B-05","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I38":[["I38-01","B","Shutter / hardware make, model and ISI mark approved","ynp","Y"],["I38-02","B","Frame size and squareness checked before fixing","yn","N"],["I38-03","D","Fixed with correct number and size of screws; holes pre-drilled","yn","N"],["I38-04","D","Floor spring box set in level before flooring","ynp","Y"],["I38-05","C","Door opens and closes freely without rubbing; no gap more than 3 mm","ynp","Y"],["I38-06","C","Hardware works smoothly; no scratches; protective film removed","yn","N"],["I38-07","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I38-08","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I39":[["I39-01","B","Glass thickness, type (toughened where specified) and make checked","ynp","Y"],["I39-02","D","Glass set with gaskets / beading; no direct glass-to-metal contact","yn","N"],["I39-03","D","Toughened glass with BIS / test mark; edges polished","ynp","Y"],["I39-04","C","Glass clean, no cracks or scratches; labels removed","ynp","Y"],["I39-05","C","Door swings both ways and returns to centre","yn","Y"],["I39-06","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I39-07","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I40":[["I40-01","B","Joint clean and dry; backer rod where gap is deep","yn","N"],["I40-02","D","Sealant of approved make applied in continuous bead","yn","N"],["I40-03","C","Bead neat and fully bonded; no gaps","ynp","N"],["I40-04","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I40-05","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I41":[["I41-01","B","Sunken area cleaned, debris removed, cracks filled","ynp","Y"],["I41-02","B","Pipe sleeves and floor traps fixed before waterproofing","yn","Y"],["I41-03","D","Waterproofing material and coats as per specification","num","N"],["I41-04","D","Corners and pipe penetrations treated with fillet / extra coat","yn","N"],["I41-05","C","Ponding test for 24 / 48 hours done; no leakage below","ynp","Y"],["I41-06","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I41-07","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I42":[["I42-01","B","Ceiling height and level marked on walls; services above ceiling completed","ynp","Y"],["I42-02","B","GI sections / boards / tiles of approved make; test certificates received","yn","Y"],["I42-03","D","Hangers / main channels at specified spacing (check c/c distance)","num","N"],["I42-04","D","Grid / framework level checked with laser or water level","ynp","Y"],["I42-05","D","Openings for lights, AC grilles, detectors cut at correct locations","yn","N"],["I42-06","C","Ceiling level within 3 mm; joints taped / tiles sitting properly","ynp","Y"],["I42-07","C","No stains, damaged boards or loose tiles","yn","N"],["I42-08","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I42-09","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I43":[["I43-01","B","Area of weak concrete marked and agreed with EIC","ynp","Y"],["I43-02","D","Work done as per specification (depth / coats / thickness checked)","num","N"],["I43-03","C","Surface sound on tapping; shown to EIC before next layer","ynp","Y"],["I43-04","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I43-05","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I44":[["I44-01","B","Area of weak concrete marked and agreed with EIC","ynp","Y"],["I44-02","D","Work done as per specification (depth / coats / thickness checked)","num","N"],["I44-03","D","Bars cleaned to bright metal; rust-inhibiting coat applied same day","ynp","Y"],["I44-04","C","Surface sound on tapping; shown to EIC before next layer","ynp","Y"],["I44-05","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I44-06","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I45":[["I45-01","B","Area of weak concrete marked and agreed with EIC","ynp","Y"],["I45-02","D","Work done as per specification (depth / coats / thickness checked)","num","N"],["I45-03","D","Bond coat applied just before mortar (mortar laid while bond coat is tacky)","yn","Y"],["I45-04","C","Surface sound on tapping; shown to EIC before next layer","ynp","Y"],["I45-05","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I45-06","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I46":[["I46-01","B","Area of weak concrete marked and agreed with EIC","ynp","Y"],["I46-02","D","Work done as per specification (depth / coats / thickness checked)","num","N"],["I46-03","D","Mortar laid in 2 layers; total 25 mm thickness checked","num","N"],["I46-04","C","Surface sound on tapping; shown to EIC before next layer","ynp","Y"],["I46-05","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I46-06","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I47":[["I47-01","B","Make, model and finish approved; item checked for damage before fixing","ynp","Y"],["I47-02","B","Fixing height and position marked as per drawing","yn","N"],["I47-03","D","Fixed with rawl plugs / brackets as recommended; level checked","yn","N"],["I47-04","C","Works correctly; no leakage at joints (water fittings)","ynp","Y"],["I47-05","C","Cleaned; protective film removed; silicone neat where used","yn","N"],["I47-06","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I47-07","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I48":[["I48-01","B","Make, model and finish approved; item checked for damage before fixing","ynp","Y"],["I48-02","B","Fixing height and position marked as per drawing","yn","N"],["I48-03","D","Fixed with rawl plugs / brackets as recommended; level checked","yn","N"],["I48-04","C","Works correctly; no leakage at joints (water fittings)","ynp","Y"],["I48-05","C","Cleaned; protective film removed; silicone neat where used","yn","N"],["I48-06","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I48-07","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I49":[["I49-01","B","Make, model and finish approved; item checked for damage before fixing","ynp","Y"],["I49-02","B","Fixing height and position marked as per drawing","yn","N"],["I49-03","D","Fixed with rawl plugs / brackets as recommended; level checked","yn","N"],["I49-04","C","Works correctly; no leakage at joints (water fittings)","ynp","Y"],["I49-05","C","Cleaned; protective film removed; silicone neat where used","yn","N"],["I49-06","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I49-07","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I50":[["I50-01","B","Make, model and finish approved; item checked for damage before fixing","ynp","Y"],["I50-02","B","Fixing height and position marked as per drawing","yn","N"],["I50-03","D","Fixed with rawl plugs / brackets as recommended; level checked","yn","N"],["I50-04","C","Works correctly; no leakage at joints (water fittings)","ynp","Y"],["I50-05","C","Cleaned; protective film removed; silicone neat where used","yn","N"],["I50-06","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I50-07","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I51":[["I51-01","B","Make, model and finish approved; item checked for damage before fixing","ynp","Y"],["I51-02","B","Fixing height and position marked as per drawing","yn","N"],["I51-03","D","Fixed with rawl plugs / brackets as recommended; level checked","yn","N"],["I51-04","C","Works correctly; no leakage at joints (water fittings)","ynp","Y"],["I51-05","C","Cleaned; protective film removed; silicone neat where used","yn","N"],["I51-06","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I51-07","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I52":[["I52-01","B","Make, model and finish approved; item checked for damage before fixing","ynp","Y"],["I52-02","B","Fixing height and position marked as per drawing","yn","N"],["I52-03","D","Fixed with rawl plugs / brackets as recommended; level checked","yn","N"],["I52-04","D","Concealed cistern frame fixed and tested before closing the wall","ynp","Y"],["I52-05","C","Works correctly; no leakage at joints (water fittings)","ynp","Y"],["I52-06","C","Cleaned; protective film removed; silicone neat where used","yn","N"],["I52-07","C","Flush works; no leakage at pan connector","yn","Y"],["I52-08","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I52-09","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I53":[["I53-01","B","Make, model and finish approved; item checked for damage before fixing","ynp","Y"],["I53-02","B","Fixing height and position marked as per drawing","yn","N"],["I53-03","D","Fixed with rawl plugs / brackets as recommended; level checked","yn","N"],["I53-04","C","Works correctly; no leakage at joints (water fittings)","ynp","Y"],["I53-05","C","Cleaned; protective film removed; silicone neat where used","yn","N"],["I53-06","C","Basin sits level under counter; sealant joint neat; waste trap fixed","yn","Y"],["I53-07","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I53-08","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I54":[["I54-01","B","Make, model and finish approved; item checked for damage before fixing","ynp","Y"],["I54-02","B","Fixing height and position marked as per drawing","yn","N"],["I54-03","D","Fixed with rawl plugs / brackets as recommended; level checked","yn","N"],["I54-04","C","Works correctly; no leakage at joints (water fittings)","ynp","Y"],["I54-05","C","Cleaned; protective film removed; silicone neat where used","yn","N"],["I54-06","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I54-07","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I55":[["I55-01","B","Make, model and finish approved; item checked for damage before fixing","ynp","Y"],["I55-02","B","Fixing height and position marked as per drawing","yn","N"],["I55-03","D","Fixed with rawl plugs / brackets as recommended; level checked","yn","N"],["I55-04","C","Works correctly; no leakage at joints (water fittings)","ynp","Y"],["I55-05","C","Cleaned; protective film removed; silicone neat where used","yn","N"],["I55-06","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I55-07","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I56":[["I56-01","B","Make, model and finish approved; item checked for damage before fixing","ynp","Y"],["I56-02","B","Fixing height and position marked as per drawing","yn","N"],["I56-03","D","Fixed with rawl plugs / brackets as recommended; level checked","yn","N"],["I56-04","C","Works correctly; no leakage at joints (water fittings)","ynp","Y"],["I56-05","C","Cleaned; protective film removed; silicone neat where used","yn","N"],["I56-06","C","Spreader distributes water evenly; waste flows freely","yn","Y"],["I56-07","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I56-08","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I57":[["I57-01","B","Granite / marble sample, colour and shade approved by EIC","ynp","Y"],["I57-02","B","Slabs checked for thickness (18 mm / 16 mm), cracks, chipped edges","yn","Y"],["I57-03","B","Base / substrate cleaned, level and right for fixing","yn","N"],["I57-04","D","Fixed with approved mortar / epoxy as per specification","yn","N"],["I57-05","D","Joints uniform and filled with matching white cement + pigment","yn","N"],["I57-06","D","Line, level and slope checked during fixing","ynp","N"],["I57-07","C","Exposed edges bull-nosed / machine polished; no hollow sound on tapping","ynp","Y"],["I57-08","C","Surface polished and waxed; stains and mortar removed","yn","N"],["I57-09","C","Finished work protected from damage by other trades","yn","N"],["I57-10","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I57-11","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I58":[["I58-01","B","Granite / marble sample, colour and shade approved by EIC","ynp","Y"],["I58-02","B","Slabs checked for thickness (18 mm / 16 mm), cracks, chipped edges","yn","Y"],["I58-03","B","Base / substrate cleaned, level and right for fixing","yn","N"],["I58-04","D","Fixed with approved mortar / epoxy as per specification","yn","N"],["I58-05","D","Joints uniform and filled with matching white cement + pigment","yn","N"],["I58-06","D","Line, level and slope checked during fixing","ynp","N"],["I58-07","C","Exposed edges bull-nosed / machine polished; no hollow sound on tapping","ynp","Y"],["I58-08","C","Surface polished and waxed; stains and mortar removed","yn","N"],["I58-09","C","Finished work protected from damage by other trades","yn","N"],["I58-10","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I58-11","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I59":[["I59-01","B","Glass thickness, type (toughened where specified) and make checked","ynp","Y"],["I59-02","D","Glass set with gaskets / beading; no direct glass-to-metal contact","yn","N"],["I59-03","D","Toughened glass with BIS / test mark; channel / patch fittings tight","ynp","Y"],["I59-04","C","Glass clean, no cracks or scratches; labels removed","ynp","Y"],["I59-05","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I59-06","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I60":[["I60-01","B","Pipe / fitting make and class approved (ISI marked)","ynp","Y"],["I60-02","B","Route and levels marked as per drawing","yn","N"],["I60-03","D","Joints made with correct solvent / fittings; clamps at specified spacing","yn","N"],["I60-04","D","Slope maintained for waste / drain lines","yn","N"],["I60-05","C","Pressure / leak test done and passed (before concealing)","ynp","Y"],["I60-06","C","Chases filled and made good after testing","yn","N"],["I60-07","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I60-08","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I61":[["I61-01","B","Shutter / hardware make, model and ISI mark approved","ynp","Y"],["I61-02","B","Frame size and squareness checked before fixing","yn","N"],["I61-03","D","Fixed with correct number and size of screws; holes pre-drilled","yn","N"],["I61-04","C","Door opens and closes freely without rubbing; no gap more than 3 mm","ynp","Y"],["I61-05","C","Hardware works smoothly; no scratches; protective film removed","yn","N"],["I61-06","C","Lock engages correctly; key works","yn","N"],["I61-07","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I61-08","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I62":[["I62-01","B","Shutter / hardware make, model and ISI mark approved","ynp","Y"],["I62-02","B","Frame size and squareness checked before fixing","yn","N"],["I62-03","D","Fixed with correct number and size of screws; holes pre-drilled","yn","N"],["I62-04","C","Door opens and closes freely without rubbing; no gap more than 3 mm","ynp","Y"],["I62-05","C","Hardware works smoothly; no scratches; protective film removed","yn","N"],["I62-06","C","Handle tight and aligned on both faces","yn","N"],["I62-07","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I62-08","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I63":[["I63-01","B","Plywood brand, grade and thickness approved (ISI mark, IS 303 / IS 710 / IS 1328 as applicable)","ynp","Y"],["I63-02","B","Frame / backing line and level checked before fixing","yn","Y"],["I63-03","B","Marine grade (IS 710) BWP ply, 12 mm, ISI mark checked","ynp","Y"],["I63-04","D","Sheets fixed with screws / nails at specified spacing; joints aligned","yn","N"],["I63-05","D","Cut edges sealed / primed; veneer grain direction consistent","yn","N"],["I63-06","D","Openings for electrical points cut neatly at marked locations","yn","N"],["I63-07","D","Aluminium frame line and level checked before fixing ply","yn","Y"],["I63-08","C","Surface flat, no bulging, no gaps at joints","ynp","Y"],["I63-09","C","Exposed edges finished with lipping / beading as per drawing","yn","N"],["I63-10","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I63-11","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I64":[["I64-01","B","Fabric sample, colour and mechanism approved","ynp","Y"],["I64-02","D","Brackets fixed level; blind width matches opening","yn","N"],["I64-03","C","Blind rolls up and down smoothly and stays in position","ynp","Y"],["I64-04","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I64-05","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I65":[["I65-01","B","Section make, profile and weight per metre approved (sample piece kept)","ynp","Y"],["I65-02","B","Powder coating / anodising thickness certificate received","yn","Y"],["I65-03","B","Site measurements and opening sizes checked against shop drawing","yn","Y"],["I65-04","D","Frames fixed plumb and square with anchor fasteners at specified spacing","ynp","N"],["I65-05","D","Weight of sections recorded for kg measurement","num","N"],["I65-06","C","Joints neat; no scratches on coating; protective tape removed","yn","N"],["I65-07","C","Shutters (if any) operate smoothly and lock properly","yn","Y"],["I65-08","C","Louver blades open and close together and lock in position","yn","Y"],["I65-09","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I65-10","M","Photo of the finished work taken from a fixed reference point","ph","N"]],"I66":[["I66-01","B","SPC planks of approved make, thickness and colour; underlay checked","ynp","Y"],["I66-02","B","Subfloor level (within 3 mm in 2 m), dry and clean","yn","Y"],["I66-03","D","Expansion gap of 8-10 mm left at walls; joints staggered","yn","N"],["I66-04","C","No gaps, lipping or hollow sound; skirting / beading fixed","ynp","Y"],["I66-05","M","Quantity measured and recorded in the Measurement Book (L x B x H as per BOQ unit)","num","N"],["I66-06","M","Photo of the finished work taken from a fixed reference point","ph","N"]]};
+  var STG = { B: "Before start", D: "During work", C: "On completion", M: "Measurement" };
+  var checks = [], ckOpen = "", ckForm = null, logDay = 0;
+  function ckList(a) { return CK[itemOf(a.id)] || []; }
+  function tOf(x) { return x.srv || x.at; }
+  function lastCheck(act, cid) { var r = null; checks.forEach(function (c) { if (c.act == act && c.check == cid && (!r || tOf(c) > tOf(r))) r = c; }); return r; }
+  function hhmm(iso) { var d = new Date(iso); return d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }); }
+  function dmy(iso) { var d = new Date(iso); return d.toLocaleDateString("en-GB", { day: "numeric", month: "short" }); }
+  /* time from the server (Date header of our own file), so a phone clock cannot be used to back-date a check */
+  async function serverTime() {
+    try {
+      var url = planInfo && planInfo.asset ? "/_blob/" + planInfo.asset : location.pathname;
+      var r = await fetch(url, { method: "HEAD", cache: "no-store" });
+      var d = r.headers.get("Date"); if (d) { var t = new Date(d); if (!isNaN(t)) return t.toISOString(); }
+    } catch (e) { }
+    return "";
+  }
+  /* date the camera wrote into the photo (EXIF DateTimeOriginal), read before the photo is shrunk */
+  async function exifDate(file) {
+    try {
+      var buf = await file.slice(0, 196608).arrayBuffer(), v = new DataView(buf);
+      if (v.getUint16(0) != 0xFFD8) return "";
+      var o = 2;
+      while (o + 4 < v.byteLength) {
+        var mk = v.getUint16(o), len = v.getUint16(o + 2);
+        if (mk == 0xFFE1 && v.getUint32(o + 4) == 0x45786966) {
+          var t = o + 10, le = v.getUint16(t) == 0x4949;
+          var g16 = function (x) { return v.getUint16(t + x, le); }, g32 = function (x) { return v.getUint32(t + x, le); };
+          var readIfd = function (off, want) {
+            var n = g16(off);
+            for (var i = 0; i < n; i++) { var e = off + 2 + i * 12; if (g16(e) == want) return g32(e + 8); }
+            return 0;
+          };
+          var ifd0 = g32(4), exif = readIfd(ifd0, 0x8769);
+          var at = exif ? readIfd(exif, 0x9003) : 0;
+          if (!at) at = readIfd(ifd0, 0x0132);
+          if (!at) return "";
+          var s2 = ""; for (var k = 0; k < 19; k++) s2 += String.fromCharCode(v.getUint8(t + at + k));
+          return s2;
+        }
+        if ((mk & 0xFF00) != 0xFF00) break;
+        o += 2 + len;
+      }
+    } catch (e) { }
+    return "";
+  }
+  function exifToDate(s2) { var m = /^(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})/.exec(s2 || ""); return m ? new Date(+m[1], m[2] - 1, +m[3], +m[4], +m[5], +m[6]) : null; }
+  function mins(a, b) { return Math.round(Math.abs(new Date(a) - new Date(b)) / 60000); }
+  function nice(m) { return m >= 120 ? Math.round(m / 60) + " h" : m + " min"; }
+  /* reasons to doubt when a check was really done */
+  function flagsOf(c) {
+    var f = [];
+    if (!c.srv) f.push("time from the phone only");
+    else if (mins(c.at, c.srv) > 10) f.push("phone clock off by " + nice(mins(c.at, c.srv)));
+    var t = tOf(c), near = 0;
+    checks.forEach(function (x) { if (x !== c && x.by == c.by && x.act != c.act && Math.abs(new Date(tOf(x)) - new Date(t)) <= 5 * 60000) near++; });
+    if (near >= 6) f.push("marked with " + near + " checks of other work within 5 min");
+    var done = null; updates.forEach(function (u) { if (u.act == c.act && u.kind == "Done" && (!done || u.at < done)) done = u.srv || u.at; });
+    if (done && c.stage != "M" && t > done && mins(t, done) > 15) f.push("marked " + nice(mins(t, done)) + " after the work was reported finished");
+    if (c.photo) {
+      var pt = exifToDate(c.photoTaken);
+      if (!pt) f.push("photo has no camera date (maybe not taken now)");
+      else if (Math.abs(pt - new Date(t)) > 60 * 60000) f.push("photo taken " + nice(Math.round(Math.abs(pt - new Date(t)) / 60000)) + (pt < new Date(t) ? " before" : " after") + " marking");
+    }
+    return f;
+  }
+  function ckBadge(c) {
+    if (!c) return '<span class="st"></span>';
+    if (c.ans == "No") return '<span class="st no">&#10007;</span>';
+    if (c.val != null && c.val !== "") return '<span class="st val">' + esc(String(c.val).slice(0, 4)) + "</span>";
+    return '<span class="st ok">&#10003;</span>';
+  }
+  function drawChecklist(a) {
+    var list = ckList(a); if (!list.length) return "";
+    var done = 0, holds = 0;
+    list.forEach(function (k) { var c = lastCheck(a.id, k[0]); if (c && c.ans != "No") done++; else if (k[4] == "Y") holds++; });
+    var h = '<div class="box"><h3>Checklist - ' + done + " of " + list.length + " done" + (holds ? ' <span class="flag">· ' + holds + " hold point" + (holds > 1 ? "s" : "") + " open</span>" : "") + '</h3><div class="cl">';
+    var stg = "";
+    list.forEach(function (k) {
+      if (k[1] != stg) { stg = k[1]; h += "<h4>" + STG[stg] + "</h4>"; }
+      var c = lastCheck(a.id, k[0]), fl = c ? flagsOf(c) : [];
+      h += '<button type="button" class="ck" data-ck="' + esc(k[0]) + '">' + ckBadge(c) + "<span>" + esc(k[2]) +
+        (c ? "<small>" + (c.ans == "No" ? "Not OK" : c.val != null && c.val !== "" ? "Value " + esc(c.val) : "OK") + " · " + dmy(tOf(c)) + " " + hhmm(tOf(c)) + ' · <span data-who="' + esc(c.by || "") + '">' + esc(names[c.by] || "") + "</span>" + (c.photo ? " · photo" : "") + "</small>" : "") +
+        (fl.length ? '<small class="flag">&#9888; ' + esc(fl.join("; ")) + "</small>" : "") + "</span><span>" +
+        (k[4] == "Y" ? '<span class="tag hold">HOLD</span> ' : "") + (k[3] == "ynp" || k[3] == "ph" ? '<span class="tag">photo</span>' : "") + "</span></button>";
+      if (ckOpen == k[0]) h += ckFormHtml(k);
+    });
+    return h + "</div></div>";
+  }
+  function ckFormHtml(k) {
+    var f = ckForm, h = '<div class="ckform">';
+    if (k[3] == "yn" || k[3] == "ynp") h += '<div class="yn"><button type="button" data-ckans="Yes" style="background:var(--done)" class="' + (f.ans == "Yes" ? "on" : "") + '">OK</button><button type="button" data-ckans="No" style="background:var(--hold)" class="' + (f.ans == "No" ? "on" : "") + '">Not OK</button></div>';
+    if (k[3] == "num") h += '<label for="ckVal">Value</label><input id="ckVal" type="number" inputmode="decimal" step="any" value="' + esc(f.val) + '">';
+    if (k[3] == "ynp" || k[3] == "ph") h += '<div class="photo"><label for="ckPhoto">Take photo (needed)</label><input id="ckPhoto" type="file" accept="image/*" capture="environment" hidden>' + (f.photo ? '<img alt="Photo for this check" src="' + f.photo + '">' : "") + "</div>";
+    h += '<input type="text" id="ckNote" placeholder="Remark (if any)" value="' + esc(f.note) + '">';
+    h += '<button type="button" class="save" id="ckSave">Save check</button></div>';
+    return h;
+  }
+  async function saveCheck() {
+    var a = openAct, k = null; ckList(a).forEach(function (x) { if (x[0] == ckOpen) k = x; }); if (!k) return;
+    var f = ckForm; f.note = ($("ckNote") && $("ckNote").value || "").trim(); if ($("ckVal")) f.val = $("ckVal").value;
+    if ((k[3] == "yn" || k[3] == "ynp") && !f.ans) { toast("Tap OK or Not OK."); return; }
+    if (k[3] == "num" && (f.val === "" || isNaN(+f.val))) { toast("Type the value."); return; }
+    if ((k[3] == "ynp" || k[3] == "ph") && !f.photo) { toast("This check needs a photo. Tap Take photo."); return; }
+    if (!db) { toast("Saving is not available on this link."); return; }
+    var b = $("ckSave"); b.disabled = true; b.textContent = "Saving...";
+    var body = { act: a.id, item: itemOf(a.id), check: k[0], stage: k[1], text: k[2], at: new Date().toISOString() };
+    body.ans = k[3] == "num" ? "Value" : k[3] == "ph" ? "Photo" : f.ans;
+    if (k[3] == "num") body.val = +f.val;
+    if (f.note) body.note = f.note;
+    if (me) body.by = me;
+    try {
+      body.srv = await serverTime();
+      if (f.photo) { var ph = await db.collection("photos").add({ data: f.photo, act: a.id, at: body.at }); body.photo = ph.id; if (f.photoTaken) body.photoTaken = f.photoTaken; }
+      await db.collection("checks").add(body);
+      toast("Check saved " + hhmm(body.srv || body.at));
+      ckOpen = ""; ckForm = null; drawCard();
+    } catch (e) {
+      b.disabled = false; b.textContent = "Save check";
+      toast(e && e.code == "quota_exceeded" ? "The store is full - ask the office." : "Not saved - check the internet and tap Save again.");
+    }
+  }
+  /* office: everything checked on one day, with server times and warnings */
+  function renderLog() {
+    var day = new Date(); day.setDate(day.getDate() + logDay);
+    var key = day.toDateString();
+    var list = checks.filter(function (c) { return new Date(tOf(c)).toDateString() == key; }).sort(function (x, y) { return tOf(x) < tOf(y) ? 1 : -1; });
+    var nb = list.filter(function (c) { return flagsOf(c).length; }).length;
+    var h = '<div class="loghead"><button type="button" id="logPrev">&#8592;</button><b>' + day.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" }) +
+            '</b><button type="button" id="logNext"' + (logDay >= 0 ? " disabled" : "") + '>&#8594;</button></div>';
+    h += '<p class="note" style="margin-top:8px">' + list.length + " checks marked" + (nb ? ' · <span class="flag">' + nb + " with warnings</span>" : "") +
+         ". Times are server times - the phone clock cannot change them.</p>";
+    if (!list.length) { $("main").innerHTML = h; return; }
+    h += '<section class="grp">';
+    list.forEach(function (c) {
+      var a = C ? find(c.act) : null, fl = flagsOf(c);
+      h += '<div class="logrow' + (fl.length ? " bad" : "") + '"><b>' + hhmm(tOf(c)) + " · " + esc(c.text || c.check) + "</b><small>" + esc(a ? a.desc + " · " + roomName(a.room) + ", " + a.where : c.act) + "</small><small>" +
+        (c.ans == "No" ? "Not OK" : c.val != null ? "Value " + esc(c.val) : "OK") + (c.note ? " · " + esc(c.note) : "") + (c.photo ? " · photo" : "") + ' · <span data-who="' + esc(c.by || "") + '"></span>' +
+        (c.srv && mins(c.at, c.srv) > 1 ? " · phone showed " + hhmm(c.at) : "") + "</small>" + (fl.length ? '<small class="flag">&#9888; ' + esc(fl.join("; ")) + "</small>" : "") + "</div>";
+    });
+    $("main").innerHTML = h + "</section>";
+    fillWho();
+  }
+  function fillWho() { document.querySelectorAll("[data-who]").forEach(function (el) { el.textContent = names[el.getAttribute("data-who")] || "Someone"; }); }
+
+  /* ---------- the activity card ---------- */
+  function openCard(id) {
+    openUpd = null;
+    var a = find(id); if (!a) return;
+    a._st = stateOf(a);
+    openAct = a;
+    form = { kind: "", pct: Math.min(90, Math.max(10, Math.round((a._st[1] || 0) / 10) * 10 + 10)), reason: "", note: "", men: {}, photo: null };
+    crewPlan(a).forEach(function (x) { form.men[x[0]] = Math.max(1, Math.ceil(x[1] - 0.05)); });
+    $("listView").hidden = true; $("sheetIn").hidden = false;
+    var pn = $("panel"); pn.classList.remove("min"); pn.classList.add("tall");
+    drawCard(); pn.scrollTop = 0;
+    colorModel(); if (byAct[a.id]) fitTo(byAct[a.id]);
+  }
+  var openUpd = null;
+  function openUpdate(id) {
+    var u = null; updates.forEach(function (x) { if (x._id == id) u = x; }); if (!u) return;
+    openUpd = u;
+    openAct = C ? find(u.act) : null;
+    $("listView").hidden = true; $("sheetIn").hidden = false;
+    var pn = $("panel"); pn.classList.remove("min"); pn.classList.add("tall");
+    drawUpdate(); pn.scrollTop = 0;
+    colorModel(); if (openAct && byAct[openAct.id]) fitTo(byAct[openAct.id]);
+    if (u.photo && !photoCache[u.photo] && db) db.doc("photos/" + u.photo).get().then(function (ph) { photoCache[u.photo] = ph.exists ? ph.data().data : "none"; if (openUpd === u) drawUpdate(); }).catch(function () { });
+  }
+  function drawUpdate() {
+    var u = openUpd, a = openAct, col = u.kind == "Done" ? COL.Done : u.kind == "In progress" ? COL["In progress"] : COL["Held up"];
+    var d = new Date(u.at), ph = u.photo ? photoCache[u.photo] : null;
+    var h = '<button type="button" class="back" id="back">&#8592; Back to updates</button>';
+    h += "<div><h2>" + esc(a ? a.desc : u.act) + '</h2><div class="where">' + esc(a ? roomName(a.room) + " · " + a.where : u.act) +
+         (a && byAct[a.id] ? " · shown in orange on the model" : "") + "</div></div>";
+    h += '<div><span class="pill" style="background:' + col + ';font-size:15px;padding:4px 12px">' + esc(u.kind == "In progress" ? (u.pct || 0) + "% done" : u.kind == "Done" ? "Finished" : HOLDLBL[u.kind] || u.kind) + "</span></div>";
+    if (u.photo) h += ph && ph != "none" ? '<img class="bigphoto" id="bigPhoto" alt="Site photo" src="' + esc(ph) + '">' : '<div class="note">' + (ph == "none" ? "The photo could not be found." : "Loading the photo...") + "</div>";
+    h += '<div class="facts"><div class="fact"><small>When</small><strong>' + d.toLocaleDateString("en-GB", { day: "numeric", month: "short" }) + ", " + d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }) +
+         '</strong></div><div class="fact"><small>By</small><strong id="updBy"></strong></div></div>';
+    if (u.men) h += '<div class="box"><h3>Men on the work</h3>' + Object.keys(u.men).map(function (k) { return u.men[k] + " " + esc(k); }).join("<br>") + "</div>";
+    if (u.note) h += '<div class="box"><h3>Note</h3><span id="updNote"></span></div>';
+    if (a) h += '<button type="button" class="save" data-act="' + esc(a.id) + '">Open this work to update it</button>';
+    $("sheetIn").innerHTML = h;
+    $("updBy").textContent = names[u.by] || "Someone";
+    if (u.note) $("updNote").textContent = u.note;
+  }
+  function showPhoto(src) {
+    var v = document.createElement("div"); v.className = "viewer"; v.setAttribute("role", "dialog");
+    v.innerHTML = '<img alt="Site photo, full size"><span>Tap to close</span>';
+    v.firstChild.src = src;
+    v.onclick = function () { v.remove(); };
+    document.body.appendChild(v);
+  }
+  function closeCard() {
+    if (openUpd) { openUpd = null; } $("sheetIn").hidden = true; $("listView").hidden = false; $("panel").classList.remove("tall"); openAct = null; render(); fitCurrent(); }
+  function drawCard() {
+    var a = openAct, s = a._st, q = leftQty(a), ci = costItem(a.id), h = "";
+    h += '<button type="button" class="back" id="back">&#8592; Back to today\'s list</button>';
+    h += "<div><h2>" + esc(a.desc) + '</h2><div class="where">' + esc(roomName(a.room) + " · " + a.where) + (byAct[a.id] ? " · " + byAct[a.id].length + " piece" + (byAct[a.id].length > 1 ? "s" : "") + " in orange on the model" : "") + "</div></div>";
+    h += '<div class="facts"><div class="fact"><small>Work left</small><strong>' + (a.qty ? r1(q) + " " + esc(a.unit) : "not measured") + '</strong></div><div class="fact"><small>Done so far</small><strong>' + (s[0] == "Done" ? 100 : s[1] || 0) + '%</strong></div>' +
+         '<div class="fact"><small>Planned days</small><strong>' + durOf(a) + "</strong></div></div>";
+    var cp = crewPlan(a);
+    if (cp.length) h += '<div class="box"><h3>Men needed each day</h3>' + cp.map(function (x) { return Math.max(1, Math.ceil(x[1] - 0.05)) + " " + esc(x[0]); }).join("<br>") + "</div>";
+    if (ci) {
+      var mats = ci.mat.filter(function (m) { return q * m[2] > 0; }).map(function (m) { return "<li>" + r1(q * m[2]) + " " + esc(m[3]) + " " + esc(m[1]) + "</li>"; });
+      if (mats.length) h += '<div class="box"><h3>Material for the work left</h3><ul>' + mats.join("") + "</ul></div>";
+    }
+    if (noResWhy(a)) h += '<div class="box"><h3>Men &amp; material</h3><span class="note">Not shown - ' + esc(noResWhy(a)) + ". Ask the office.</span></div>";
+    var wait = (a.preds || []).map(function (p) { var b = find(p[0]); return b ? esc(b.desc) + " (" + esc(roomName(b.room)) + ")" + (stateOf(b)[0] == "Done" ? " &#10003;" : "") : ""; }).filter(Boolean);
+    if (wait.length) h += '<div class="box"><h3>Comes after</h3>' + wait.join("<br>") + "</div>";
+    h += drawChecklist(a);
+    h += '<div class="answers">';
+    h += '<button type="button" class="big done' + (form.kind == "Done" ? " sel" : "") + '" data-kind="Done">Finished <small>all of it</small></button>';
+    h += '<button type="button" class="big prog' + (form.kind == "In progress" ? " sel" : "") + '" data-kind="In progress">Working <small>part done</small></button>';
+    h += '<button type="button" class="big hold' + (form.kind == "hold" ? " sel" : "") + '" data-kind="hold">Problem <small>work stopped</small></button></div>';
+    if (form.kind) {
+      if (form.kind == "In progress") {
+        h += '<div class="box"><h3>How much is done?</h3><div class="pick">';
+        for (var p = 10; p <= 90; p += 10) h += '<button type="button" data-pct="' + p + '" class="' + (form.pct == p ? "on" : "") + '">' + p + "%</button>";
+        h += "</div></div>";
+      }
+      if (form.kind == "hold") {
+        h += '<div class="box"><h3>What is the problem?</h3><div class="reasons">';
+        HOLD.forEach(function (k) { h += '<button type="button" data-reason="' + esc(k) + '" class="' + (form.reason == k ? "on" : "") + '">' + esc(HOLDLBL[k]) + "</button>"; });
+        h += "</div></div>";
+      }
+      var keys = Object.keys(form.men);
+      if (keys.length && form.kind != "hold") {
+        h += '<div class="box"><h3>Men on this work today</h3><div class="men">';
+        keys.forEach(function (k, i) { h += '<div class="m"><span>' + esc(k) + '</span><button type="button" data-men="' + i + '" data-d="-1" aria-label="One less">&#8722;</button><output id="men' + i + '">' + form.men[k] + '</output><button type="button" data-men="' + i + '" data-d="1" aria-label="One more">+</button></div>'; });
+        h += "</div></div>";
+      }
+      h += '<label class="box" for="uNote" style="display:grid;gap:6px"><h3 style="margin:0">' + (form.kind == "hold" && form.reason == "Other" ? "What happened? (needed)" : "Note (if any)") + '</h3><textarea id="uNote" rows="2">' + esc(form.note) + "</textarea></label>";
+      h += '<div class="photo"><label for="uPhoto">Add photo</label><input id="uPhoto" type="file" accept="image/*" capture="environment" hidden>' + (form.photo ? '<img alt="Photo to send" src="' + form.photo + '">' : '<span class="where">optional</span>') + "</div>";
+      h += '<button type="button" class="save" id="uSave">Save update</button>';
+    }
+    $("sheetIn").innerHTML = h;
+    fillWho();
+  }
+  function shrinkPhoto(file) {
+    return new Promise(function (res, rej) {
+      var img = new Image(), url = URL.createObjectURL(file);
+      img.onload = function () {
+        var k = Math.min(1, 900 / Math.max(img.width, img.height)), c = document.createElement("canvas");
+        c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
+        c.getContext("2d").drawImage(img, 0, 0, c.width, c.height); URL.revokeObjectURL(url);
+        var q = 0.7, d = c.toDataURL("image/jpeg", q);
+        while (d.length > 180000 && q > 0.3) { q -= 0.1; d = c.toDataURL("image/jpeg", q); }
+        res(d);
+      };
+      img.onerror = rej; img.src = url;
+    });
+  }
+  async function save() {
+    var a = openAct, kind = form.kind == "hold" ? form.reason : form.kind;
+    form.note = ($("uNote") && $("uNote").value || "").trim();
+    if (!kind) { toast("Tap what the problem is."); return; }
+    if (kind == "Other" && !form.note) { toast("Write a few words about the problem."); return; }
+    if (kind == "Done" && !form.holdOk) {
+      var open = ckList(a).filter(function (k) { var c = lastCheck(a.id, k[0]); return k[4] == "Y" && (!c || c.ans == "No"); });
+      if (open.length) { form.holdOk = true; toast(open.length + " hold point" + (open.length > 1 ? "s are" : " is") + " not OK yet. Tap Save again to finish anyway."); return; }
+    }
+    if (!db) { toast("Saving is not available on this link. Ask the office for access."); return; }
+    var b = $("uSave"); b.disabled = true; b.textContent = "Saving...";
+    var body = { act: a.id, kind: kind, at: new Date().toISOString() };
+    if (kind == "In progress") body.pct = form.pct; else if (kind == "Done") body.pct = 100;
+    if (form.note) body.note = form.note;
+    if (kind == "Done" || kind == "In progress") { var m = {}; Object.keys(form.men).forEach(function (k) { if (form.men[k] > 0) m[k] = form.men[k]; }); if (Object.keys(m).length) body.men = m; }
+    if (me) body.by = me;
+    try {
+      body.srv = await serverTime();
+      if (form.photo) { var ph = await db.collection("photos").add({ data: form.photo, act: a.id, at: body.at }); body.photo = ph.id; if (form.photoTaken) body.photoTaken = form.photoTaken; }
+      await db.collection("updates").add(body);
+      toast("Saved: " + a.desc + " - " + (kind == "Done" ? "finished" : kind == "In progress" ? form.pct + "% done" : HOLDLBL[kind]));
+      closeCard();
+    } catch (e) {
+      b.disabled = false; b.textContent = "Save update";
+      if (e && (e.code == "permission_denied" || e.code == "not_granted")) toast("This link can't save updates. Ask the office to give you edit (Contributor) access.");
+      else if (e && e.code == "quota_exceeded") toast("The update store is full. Ask the office to clear old photos.");
+      else toast("Not saved - check the internet and tap Save again.");
+    }
+  }
+
+  /* ---------- office: send plan, download updates ---------- */
+  function renderOffice() {
+    var o = $("office");
+    if (!canEdit) { o.hidden = true; return; }
+    o.hidden = false;
+    var since = planInfo && planInfo.at ? updates.filter(function (u) { return u.at >= planInfo.at; }).length : updates.length;
+    o.innerHTML = "<h2>Office</h2>" +
+      '<label class="btn" for="planFile">Send today\'s plan and model<small>Choose both <span class="mono">RPQS_phone.json</span> and <span class="mono">RPQS_model.json</span> from the project folder (SketchUp writes them on every Sync). ' +
+      (P ? "Last sent: " + esc(P.made) + "." : "Not sent yet.") + '</small></label><input id="planFile" type="file" accept=".json,application/json" multiple hidden>' +
+      '<button type="button" class="btn" id="getCsv">Download site updates for Excel<small>' + updates.length + " updates in all, " + since + " since the last plan. Saves <span class=\"mono\">RPQS_site_updates.csv</span>; SketchUp picks it up from Downloads on the next Sync.</small></button>";
+  }
+  async function sendPlan(files) {
+    try {
+      if (!assets) { toast("Only the owner or an editor can send the plan."); return; }
+      var plan = null, planTxt = "", modelTxt = "";
+      for (var i = 0; i < files.length; i++) {
+        var txt = await files[i].text(), j = null;
+        try { j = JSON.parse(txt); } catch (e) { continue; }
+        if (j && j.app == "rpqs-site-1" && j.cpm) { plan = j; planTxt = txt; }
+        else if (j && j.format == "remwo-web-1") modelTxt = txt;
+      }
+      if (!plan && !modelTxt) { toast("Pick RPQS_phone.json and RPQS_model.json from the project folder."); return; }
+      toast("Sending...");
+      var doc = { at: new Date().toISOString() };
+      if (planInfo && planInfo.asset) { doc.asset = planInfo.asset; doc.made = planInfo.made; }
+      if (planInfo && planInfo.model) doc.model = planInfo.model;
+      if (plan) { var up = await assets.upload(new Blob([planTxt], { type: "application/json" }), { type: "application/json" }); doc.asset = up.id; doc.made = plan.made; }
+      if (modelTxt) { var um = await assets.upload(new Blob([modelTxt], { type: "application/json" }), { type: "application/json" }); doc.model = um.id; }
+      if (!doc.asset) { toast("Also pick RPQS_phone.json - the phone needs today's plan."); return; }
+      await db.doc("plan/current").set(doc);
+      toast((plan ? "Plan" : "") + (plan && modelTxt ? " and model" : modelTxt ? "Model" : "") + " sent. The site phone shows it now.");
+    } catch (e) { toast("Not sent: " + (e && e.message ? e.message : "try again")); }
+  }
+  async function getCsv() {
+    var dl = await claude.use("downloads");
+    if (!dl) { toast("Download is not available here. Open this page in a browser on the office PC."); return; }
+    var q = function (v) { v = v == null ? "" : String(v); return '"' + v.replace(/"/g, '""') + '"'; };
+    var lines = ["Date,Time,Element ID,Activity ID,Update,% complete,Piece % after update,Note,By,Men today,Photo"], photos = [];
+    function pname(u) { var d = new Date(u.at), z = function (n) { return (n < 10 ? "0" : "") + n; }; return d.getFullYear() + z(d.getMonth() + 1) + z(d.getDate()) + "_" + z(d.getHours()) + z(d.getMinutes()) + "_" + u.act + "_" + u.photo + ".jpg"; }
+    var asc = updates.slice().sort(function (a, b) { return a.at < b.at ? -1 : 1; }), run = {};
+    asc.forEach(function (u) {
+      if (u.kind == "Done") run[u.act] = 100; else if (u.kind == "In progress") run[u.act] = u.pct || 0;
+      var d = new Date(u.at), els = (P && P.els[u.act] && P.els[u.act].length) ? P.els[u.act] : [u.act];
+      var men = u.men ? Object.keys(u.men).map(function (k) { return u.men[k] + " " + k; }).join("; ") : "";
+      els.forEach(function (el) {
+        lines.push([q(d.toLocaleDateString("en-GB")), q(d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })), q(el), q(u.act), q(u.kind),
+          q(u.pct == null ? "" : u.pct), q(run[u.act] || 0), q(u.note || ""), q(names[u.by] || "Site"), q(men), q(u.photo ? pname(u) : "")].join(","));
+      });
+      if (u.photo) photos.push(u);
+    });
+    var ckRows = checks.slice().sort(function (x, y) { return tOf(x) < tOf(y) ? -1 : 1; });
+    if (ckRows.length) {
+      lines.push("#CHECKS");
+      lines.push("Date,Time (server),Activity ID,Check no,Stage,Check point,Answer,Value,Remark,By,Phone time,Warnings,Photo");
+      ckRows.forEach(function (c) {
+        var d = new Date(tOf(c)), pn = c.photo ? pname({ at: c.at, act: c.act + "_" + c.check, photo: c.photo }) : "";
+        lines.push([q(d.toLocaleDateString("en-GB")), q(c.srv ? hhmm(c.srv) : ""), q(c.act), q(c.check), q(STG[c.stage] || c.stage), q(c.text || ""), q(c.ans == "No" ? "Not OK" : c.ans == "Yes" ? "OK" : c.ans),
+          q(c.val == null ? "" : c.val), q(c.note || ""), q(names[c.by] || "Site"), q(hhmm(c.at)), q(flagsOf(c).join("; ")), q(pn)].join(","));
+        if (c.photo) photos.push({ at: c.at, act: c.act + "_" + c.check, photo: c.photo });
+      });
+    }
+    if (photos.length) {
+      toast("Collecting " + photos.length + " photos...");
+      lines.push("#PHOTOS");
+      for (var k = 0; k < photos.length; k++) {
+        var u2 = photos[k], data = photoCache[u2.photo];
+        if (!data || data == "none") { try { var ph = await db.doc("photos/" + u2.photo).get(); data = ph.exists ? ph.data().data : ""; photoCache[u2.photo] = data || "none"; } catch (e) { data = ""; } }
+        if (data && data != "none") lines.push(pname(u2) + "," + String(data).replace(/^data:[^,]*,/, ""));
+      }
+    }
+    var stamp = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "");
+    try { await dl.save({ filename: "RPQS_site_updates_" + stamp + ".csv", data: lines.join("\r\n") }); toast("Saved" + (photos.length ? " with " + photos.length + " photos" : "") + ". Now Sync in SketchUp."); }
+    catch (e) { if (e && e.code != "declined") toast("Download failed - try again."); }
+  }
+
+  /* ---------- events ---------- */
+  document.addEventListener("click", function (ev) {
+    if (ev.target.id == "bigPhoto") { showPhoto(ev.target.src); return; }
+    var b = ev.target.closest("button"); if (!b) return;
+    if (b.dataset.room != null) { room = b.dataset.room; if (openAct) closeCard(); else render(); fitCurrent(); return; }
+    if (b.dataset.act) { openCard(b.dataset.act); return; }
+    if (b.id == "back") { closeCard(); return; }
+    if (b.dataset.upd) { openUpdate(b.dataset.upd); return; }
+    if (b.id == "tToday") { tab = "today"; render(); return; }
+    if (b.id == "tDone") { tab = "done"; render(); return; }
+    if (b.id == "tCk") { tab = "ck"; render(); return; }
+    if (b.id == "logPrev") { logDay--; renderLog(); return; }
+    if (b.id == "logNext") { if (logDay < 0) logDay++; renderLog(); return; }
+    if (b.id == "getCsv") { getCsv(); return; }
+    if (!openAct) return;
+    if (b.dataset.kind) { form.note = ($("uNote") && $("uNote").value) || form.note; form.kind = b.dataset.kind; drawCard(); return; }
+    if (b.dataset.pct) { form.pct = +b.dataset.pct; drawCard(); return; }
+    if (b.dataset.reason) { form.note = ($("uNote") && $("uNote").value) || form.note; form.reason = b.dataset.reason; drawCard(); return; }
+    if (b.dataset.men) { var k = Object.keys(form.men)[+b.dataset.men]; form.men[k] = Math.max(0, form.men[k] + (+b.dataset.d)); $("men" + b.dataset.men).textContent = form.men[k]; return; }
+    if (b.id == "uSave") save();
+    if (b.dataset.ck) { var keepNote = $("uNote") ? $("uNote").value : ""; form.note = keepNote || form.note; ckOpen = ckOpen == b.dataset.ck ? "" : b.dataset.ck; ckForm = { ans: "", val: "", note: "", photo: null, photoTaken: "" }; drawCard(); return; }
+    if (b.dataset.ckans) { if ($("ckNote")) ckForm.note = $("ckNote").value; if ($("ckVal")) ckForm.val = $("ckVal").value; ckForm.ans = b.dataset.ckans; drawCard(); return; }
+    if (b.id == "ckSave") saveCheck();
+  });
+  document.addEventListener("change", async function (ev) {
+    var t = ev.target;
+    if (t.id == "planFile" && t.files.length) { sendPlan(Array.prototype.slice.call(t.files)); t.value = ""; }
+    if (t.id == "uPhoto" && t.files[0]) {
+      form.note = ($("uNote") && $("uNote").value) || form.note;
+      try { form.photoTaken = await exifDate(t.files[0]); form.photo = await shrinkPhoto(t.files[0]); drawCard(); } catch (e) { toast("That photo could not be read."); }
+    }
+    if (t.id == "ckPhoto" && t.files[0] && ckForm) {
+      if ($("ckNote")) ckForm.note = $("ckNote").value; if ($("ckVal")) ckForm.val = $("ckVal").value;
+      try { ckForm.photoTaken = await exifDate(t.files[0]); ckForm.photo = await shrinkPhoto(t.files[0]); drawCard(); } catch (e) { toast("That photo could not be read."); }
+    }
+  });
+
+  /* ---------- start ---------- */
+  async function loadPlan(info) {
+    planInfo = info || {};
+    if (!info || !info.asset) { P = null; C = null; render(); $("msg").textContent = "No plan sent yet."; return; }
+    try {
+      var r = await fetch("/_blob/" + info.asset); if (!r.ok) throw new Error(r.status);
+      P = await r.json(); C = P.cpm;
+    } catch (e) { P = null; C = null; toast("Could not load the plan - check the internet."); }
+    render();
+    if (info.model && info.model != modelId) {
+      $("msg").hidden = false; $("msg").textContent = "Loading the model...";
+      try { var rm = await fetch("/_blob/" + info.model); if (!rm.ok) throw new Error(rm.status); M = await rm.json(); modelId = info.model; buildModel(M); }
+      catch (e) { $("msg").textContent = "The model could not be loaded - check the internet and reopen the page."; }
+    } else if (!info.model) { $("msg").hidden = false; $("msg").textContent = "No model sent yet. In the office: Send today's plan with RPQS_model.json."; }
+    if (openAct) { var a = find(openAct.id); if (a) { openAct = a; a._st = stateOf(a); } }
+  }
+  async function resolveNames() {
+    if (!userNS) return;
+    var ids = []; updates.forEach(function (u) { if (u.by && ids.indexOf(u.by) < 0) ids.push(u.by); });
+    if (!ids.length) return;
+    try { var ps = await userNS.profiles(ids); ids.forEach(function (id) { names[id] = (ps[id] && ps[id].name) || "Someone"; }); } catch (e) { }
+  }
+  async function start() {
+    render();
+    if (!window.claude || !claude.use) { planInfo = {}; render(); return; }
+    db = await claude.use("db");
+    userNS = await claude.use("user");
+    if (userNS) {
+      try { me = await userNS.id(); } catch (e) { }
+      try { canEdit = await userNS.canEdit(); } catch (e) { canEdit = false; }
+      try { var p = await userNS.me(); if (p && p.name) $("who").textContent = p.name; } catch (e) { }
+    }
+    if (canEdit) assets = await claude.use("assets");
+    if (!db) { planInfo = {}; $("main").innerHTML = '<div class="note">Open this from the REMWO Site bot in Telegram.</div>'; renderOffice(); return; }
+    db.doc("plan/current").onSnapshot(function (snap) { loadPlan(snap.exists ? snap.data() : null); }, function () { planInfo = {}; render(); });
+    var gotUpdates = async function (snap) {
+      updates = snap.docs.map(function (d) { var x = Object.assign({}, d.data() || {}); x._id = d.id; return x; }).filter(function (u) { return u && u.act && u.kind && u.at; });
+      updates.sort(function (a, b) { return a.at < b.at ? 1 : a.at > b.at ? -1 : 0; });
+      if (!openAct) render(); else renderOffice();
+      resolveNames().then(function () { if (!openAct && tab == "done") renderUpdates(); }).catch(function () { });
+    };
+    db.collection("updates").onSnapshot(gotUpdates, function (e) {
+      toast("Updates could not be loaded (" + (e && e.code ? e.code : "error") + "). Reload the page.");
+      db.collection("updates").get().then(gotUpdates).catch(function () { });
+    });
+    db.collection("updates").get().then(gotUpdates).catch(function (e) { toast("Updates could not be read (" + (e && e.code ? e.code : "error") + ")."); });
+    var gotChecks = function (snap) {
+      checks = snap.docs.map(function (d) { var x = Object.assign({}, d.data() || {}); x._id = d.id; return x; }).filter(function (c) { return c && c.act && c.check && c.at; });
+      var ids = []; checks.forEach(function (c) { if (c.by && !names[c.by] && ids.indexOf(c.by) < 0) ids.push(c.by); });
+      if (ids.length && userNS) userNS.profiles(ids).then(function (ps) { ids.forEach(function (id) { names[id] = (ps[id] && ps[id].name) || "Someone"; }); fillWho(); }).catch(function () { });
+      if (openAct && !openUpd && !ckOpen) drawCard(); else if (!openAct) render();
+    };
+    db.collection("checks").onSnapshot(gotChecks, function () { db.collection("checks").get().then(gotChecks).catch(function () { }); });
+  }
+  start();
+})();
+</script>
+
+</body></html>
